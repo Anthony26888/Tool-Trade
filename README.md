@@ -284,6 +284,150 @@ What does not vary anymore: the analyzed company identity is resolved determinis
 
 Backtest results are not guaranteed to match any published figure. Returns depend on the model, the temperature, the date range, data quality, and the sampling above. Treat the framework as a research scaffold for studying multi-agent analysis, not as a strategy with a fixed, replicable return.
 
+## BTCUSDT Signal Engine — Production Runtime & CLI (Phase 14)
+
+The repo extends TradingAgents into a BTCUSDT Binance Futures **AI Signal + DEMO
+Trading** system. Phase 14 provides a 24/7 runtime that wires the 1H AI analysis
+scheduler, the 1m TP/SL monitor, the DEMO account, SQLite persistence, and
+(read-only) Telegram notifications into one daemon.
+
+**Run the daemon (blocks, Ctrl-C / SIGTERM to stop gracefully):**
+
+```bash
+python -m signal_engine
+```
+
+**One analysis + monitor pass, then exit (cron / CI):**
+
+```bash
+python -m signal_engine --once
+```
+
+**Query SQLite while the daemon runs** (`--json` for machine-readable output):
+
+```bash
+python -m signal_engine status    # daemon health + active signal
+python -m signal_engine signals   # recent signals
+python -m signal_engine active    # the active signal (PENDING_ENTRY / OPEN)
+python -m signal_engine demo      # demo account, trades, statistics
+python -m signal_engine health    # subsystem health (exit 0 only when alive)
+```
+
+**Guarantees**
+
+- At most **one** active signal/position for BTCUSDT; while one exists the AI is
+  locked and no new signal is created (AGENTS.md section 3).
+- AI analysis only on **closed 1H candles**; TP/SL monitoring uses **1m closed
+  candles**, independent of the 1H cycle.
+- SQLite is the source of truth. On restart the daemon recovers the active
+  signal and reconciles the demo ledger **without** re-notifying, re-opening, or
+  re-closing anything.
+- DEMO is simulated only: no real Binance order is ever placed and no trading
+  API key is used. Never set real credentials in the environment.
+
+**Configuration** (optional, see `.env.example`): `BTCUSDT_LLM_*`,
+`BTCUSDT_TELEGRAM_*`, `BTCUSDT_SYMBOL`, `BTCUSDT_TIMEFRAME`, `BTCUSDT_DB_PATH`,
+`BTCUSDT_RUNTIME_SCHEDULER_POLL`, `BTCUSDT_RUNTIME_MONITOR_POLL`, and the
+`BTCUSDT_DEMO_*` account settings (defaults: 20 USDT balance, 2 USDT margin,
+10x leverage, 1% risk, 0.04% fee).
+
+> Research only: this system generates signals and simulates trades. It does not
+> guarantee win rates or returns, and no real-money order execution is enabled.
+
+## BTCUSDT Web Dashboard & Settings (Phase 15)
+
+Phase 15 adds a dependency-free web dashboard over the same SQLite ledger plus a
+Settings page that controls the AI provider and the demo/Telegram configuration
+through the `signal_engine.config.ConfigService` safety rules.
+
+**Run the dashboard** (blocks, Ctrl-C to stop):
+
+```bash
+python -m signal_engine web                # http://127.0.0.1:8000
+python -m signal_engine web --host 0.0.0.0 --port 9000
+```
+
+**What you get**
+
+- **Dashboard** — Demo balance/equity, net PnL, win rate, peak equity, max
+  drawdown, the current signal (with entry/TP/SL), the open position, and the
+  daemon's subsystem health. A zero-dependency **BTCUSDT price chart** (canvas
+  candlesticks, 1H/4H/1D selector) tracks with each 15s poll and overlays the
+  active signal's Entry/TP/SL levels; it refreshes live from Binance public
+  klines for reference only and is never used by the AI or the TP/SL monitor.
+  While a position is **OPEN**, the Current Signal
+  panel also previews the exact demo-account outcome for each exit level
+  (`TP outcome` / `SL outcome`: gross, fees, net PnL in $ and %, and the
+  projected balance/peak) using the same formulas the executor will persist.
+- **Signals / Trades / Statistics** — read-only views over the signal and demo
+  trade ledgers. The only web-layer write is one idempotent bootstrap: opening
+  the dashboard lazily creates the demo account row (`ensure_account`, never
+  resets an existing account) so the Demo panel shows values even before the
+  daemon's first run.
+- **Settings** — AI provider (Ollama or an OpenAI-compatible API with openai /
+  deepseek / custom presets), demo account, and Telegram. Every change is
+  validated, audited, and never reacts mid-trade:
+  - An AI-provider change is **staged** while a signal is active and applied
+    automatically when the system goes idle (before the next analysis).
+  - Demo settings are **refused (HTTP 409)** while a signal is active; the
+    balance/equity/peak are never editable.
+  - API keys and bot tokens are stored in a separate `0600` secrets file
+    (`data/btcusdt_secrets.json`, override `BTCUSDT_SECRETS_FILE`), masked in
+    the UI, and never written to SQLite, logs, errors, or Telegram.
+
+**Dashboard stack**: the standard-library `http.server.ThreadingHTTPServer`
+(no Flask/FastAPI), a small JSON API under `/api/*`, and a vanilla-JS single
+page app under `/static/*`. Source: `web/server.py`, `web/static/`.
+
+> Research only: this system generates signals and simulates trades. It does not
+> guarantee win rates or returns, and no real-money order execution is enabled.
+
+## Deploy via Docker (single container: daemon + dashboard)
+
+The `Dockerfile` + `docker-compose.yml` package the whole system into **one
+container** that runs both the daemon (AI 1H analysis, TP/SL 1m monitoring,
+demo ledger) and the web dashboard. No real Binance order execution is included.
+
+**On the server** (git clone → build → run):
+
+```bash
+git clone <repo-url> TradingAgents && cd TradingAgents
+cp .env.example .env            # then edit the admin/provider section
+docker compose up -d --build
+docker compose ps               # signalengine: running (healthy)
+curl http://localhost:8000/api/health    # {"ok": true, "health": {...}}
+# Dashboard -> http://SERVER:8000
+```
+
+**Choose one AI provider in `.env`**
+
+- **Ollama on the server host** (models already pulled): set
+  `BTCUSDT_LLM_PROVIDER=ollama`, `BTCUSDT_LLM_MODEL=qwen3:4b` and
+  `OLLAMA_BASE_URL=http://host.docker.internal:11434`. The host Ollama must
+  listen on `0.0.0.0` (`export OLLAMA_HOST=0.0.0.0`) so the container can reach
+  it through `host.docker.internal` (mapped via `extra_hosts` in compose).
+- **OpenRouter** (no local model): set `BTCUSDT_LLM_PROVIDER=openrouter`,
+  `BTCUSDT_LLM_MODEL=<model id>` and `OPENROUTER_API_KEY=sk-or-...`.
+
+**Operational notes**
+
+- `btcusdt_data` volume → `/app/data` holds the SQLite ledger and the `0600`
+  secrets file, so the database, API keys, and an OPEN demo position survive
+  `docker compose down/up --build`. On restart the daemon resumes monitoring an
+  OPEN position without re-analyzing (AGENTS.md section 18).
+- Settings saved on the Dashboard Settings page take precedence over `.env`
+  (priority: database > env > defaults) and apply to future analyses only.
+- The process runs as the non-root `appuser`; `/app/data` is pre-created with
+  the right ownership in the image.
+- Update after code changes: `docker compose up -d --build`.
+- Migrating an existing dev database/secrets: copy the `data/` directory
+  contents into the `btcusdt_data` volume (or reconfigure from the Settings
+  page). The demo account is created lazily by the dashboard if missing, and is
+  never reset if present.
+
+> Research only: this system generates signals and simulates trades. It does not
+> guarantee win rates or returns, and no real-money order execution is enabled.
+
 ## Contributing
 
 Contributions are welcome: bug fixes, documentation, and feature ideas; past contributions are credited per release in [`CHANGELOG.md`](CHANGELOG.md).
