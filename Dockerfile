@@ -32,6 +32,7 @@ RUN useradd --create-home appuser \
 
 COPY --from=builder /build .
 COPY docker/entrypoint-signalengine.sh /entrypoint.sh
+RUN sed -i 's/\r$//' /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 USER appuser
