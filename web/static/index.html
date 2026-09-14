@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NEXTRA AI — BTCUSDT Signal Engine</title>
+  <link rel="icon" type="image/png" href="/static/logo.png" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <img class="brand-logo" src="/static/logo.png" alt="NEXTRA AI" />
+        <div>
+          <div class="brand-title">NEXTRA AI</div>
+          <div class="brand-sub">Signal Engine</div>
+        </div>
+      </div>
+      <nav class="nav">
+        <button class="nav-item active" data-panel="dashboard">Dashboard</button>
+        <button class="nav-item" data-panel="signals">Signals</button>
+        <button class="nav-item" data-panel="trades">Trades</button>
+        <button class="nav-item" data-panel="statistics">Statistics</button>
+        <button class="nav-item" data-panel="settings">Settings</button>
+      </nav>
+      <div class="sidebar-foot">
+        <div class="foot-row"><span>Symbol</span><strong id="sideSymbol">BTCUSDT</strong></div>
+        <div class="foot-row"><span>Mode</span><strong class="mode-chip">DEMO</strong></div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <div id="pageTitle" class="page-title">Dashboard</div>
+          <div id="pageSub" class="page-sub">Signal &amp; demo trading overview</div>
+        </div>
+        <div class="topbar-right">
+          <span id="statusPill" class="status-pill">—</span>
+        </div>
+      </header>
+
+      <section id="panel-dashboard" class="panel active">
+        <div class="cards" id="dashboardCards"></div>
+        <section class="card">
+          <div class="card-head">
+            <h2 class="card-title" id="priceCardTitle">BTCUSDT Price</h2>
+            <div class="chart-controls">
+              <span id="chartLive" class="chart-live"></span>
+              <select id="chartInterval" class="chart-interval" aria-label="Chart timeframe">
+                <option value="1m">1M</option>
+                <option value="5m">5M</option>
+                <option value="15m">15M</option>
+                <option value="1h" selected>1H</option>
+                <option value="4h">4H</option>
+              </select>
+            </div>
+          </div>
+          <div class="chart-toolbar">
+            <button type="button" id="chartZoomIn" class="chart-btn" title="Zoom in">＋</button>
+            <button type="button" id="chartZoomOut" class="chart-btn" title="Zoom out">−</button>
+            <button type="button" id="chartPanLeft" class="chart-btn" title="Pan left">◀</button>
+            <button type="button" id="chartPanRight" class="chart-btn" title="Pan right">▶</button>
+            <button type="button" id="chartReset" class="chart-btn secondary" title="Reset view">Reset</button>
+            <span id="chartRange" class="chart-range"></span>
+          </div>
+          <div class="chart-wrap">
+            <canvas id="priceChart"></canvas>
+            <div id="chartMsg" class="chart-msg"></div>
+          </div>
+          <div id="chartLegend" class="chart-legend"><span class="muted">Chart updates every 15s</span></div>
+        </section>
+        <div class="grid-2">
+          <section class="card">
+            <div class="card-head">
+              <h2 class="card-title">Current Signal</h2>
+              <button type="button" id="chatOpenBtn" class="btn ai-btn" title="Ask about this signal">🤖 AI</button>
+            </div>
+            <div id="currentSignal"></div>
+          </section>
+          <section class="card">
+            <h2 class="card-title">System Health</h2>
+            <div id="systemHealth"></div>
+          </section>
+        </div>
+      </section>
+
+      <section id="panel-signals" class="panel">
+        <section class="card">
+          <h2 class="card-title">Signal History</h2>
+          <div class="toolbar" id="signalsToolbar">
+            <label class="toolbar-item">Direction
+              <select id="sigDir">
+                <option value="">All</option>
+                <option value="LONG">LONG</option>
+                <option value="SHORT">SHORT</option>
+              </select>
+            </label>
+            <label class="toolbar-item">Status
+              <select id="sigStatus">
+                <option value="">All</option>
+                <option value="TP_HIT">TP HIT</option>
+                <option value="SL_HIT">SL HIT</option>
+                <option value="PENDING_ENTRY">PENDING</option>
+                <option value="OPEN">OPEN</option>
+                <option value="CANCELLED">CANCELLED</option>
+              </select>
+            </label>
+            <label class="toolbar-item">Time (VN)
+              <select id="sigTime">
+                <option value="">All</option>
+                <option value="today">Today</option>
+                <option value="7d">7 days</option>
+                <option value="30d">30 days</option>
+              </select>
+            </label>
+            <button class="btn toolbar-item" id="sigSelAll" type="button">Select all</button>
+            <button class="btn danger toolbar-item" id="sigDeleteSel" type="button" disabled>Delete selected (0)</button>
+            <button class="btn danger toolbar-item" id="sigDeleteAll" type="button">Delete all history</button>
+          </div>
+          <div class="table-wrap" id="signalsTable"><p class="muted">Loading…</p></div>
+        </section>
+      </section>
+
+      <section id="panel-trades" class="panel">
+        <section class="card">
+          <h2 class="card-title">Demo Trades</h2>
+          <div class="table-wrap" id="tradesTable"><p class="muted">Loading…</p></div>
+        </section>
+      </section>
+
+      <section id="panel-statistics" class="panel">
+        <div class="cards" id="statsCards"></div>
+        <section class="card">
+          <h2 class="card-title">Performance Detail</h2>
+          <div id="statsDetail"></div>
+        </section>
+      </section>
+
+      <section id="panel-settings" class="panel">
+        <div id="settingsNotice"></div>
+        <div class="grid-2">
+          <section class="card">
+            <h2 class="card-title">AI Provider</h2>
+            <form id="aiForm" class="form"></form>
+          </section>
+          <section class="card">
+            <h2 class="card-title">Demo Account</h2>
+            <form id="demoForm" class="form"></form>
+          </section>
+        </div>
+        <div class="grid-2">
+          <section class="card">
+            <h2 class="card-title">Telegram Notifications</h2>
+            <form id="telegramForm" class="form"></form>
+          </section>
+          <section class="card">
+            <h2 class="card-title">Runtime &amp; System</h2>
+            <form id="symbolForm" class="form">
+              <div class="field">
+                <label>Active Symbol (analysed)</label>
+                <select id="symbolSelect" aria-label="Analysed symbol">
+                  <option value="BTCUSDT">BTCUSDT</option>
+                  <option value="ETHUSDT">ETHUSDT</option>
+                  <option value="XAUUSDT">XAUUSDT</option>
+                </select>
+              </div>
+              <div class="hint">One symbol is analysed at a time (1H closed candles). A switch applies to the NEXT analysis once no signal is active — an open position is never affected.</div>
+              <button type="button" class="btn" id="saveSymbol">Save Symbol</button>
+            </form>
+            <div id="runtimeBox" class="form"></div>
+          </section>
+        </div>
+        <section class="card">
+          <h2 class="card-title">Settings Audit</h2>
+          <div class="table-wrap" id="auditBox"><p class="muted">Loading…</p></div>
+        </section>
+      </section>
+    </main>
+  </div>
+
+  <div id="chatBackdrop" class="chat-backdrop hidden"></div>
+  <aside id="chatDrawer" class="chat-drawer" aria-hidden="true" aria-label="Signal chat">
+    <div class="chat-head">
+      <div>
+        <div class="chat-title">Signal Chat · NEXTRA AI</div>
+        <div id="chatContext" class="chat-context"></div>
+      </div>
+      <button type="button" id="chatClose" class="chat-close" title="Close">×</button>
+    </div>
+    <div id="chatMessages" class="chat-messages"><p class="muted">Start a conversation about the current signal.</p></div>
+    <div class="chat-quick">
+      <button type="button" class="chat-chip" data-q="Tại sao chọn signal này?">Tại sao chọn?</button>
+      <button type="button" class="chat-chip" data-q="Rủi ro nếu Stop Loss bị chạm là như thế nào?">Rủi ro SL?</button>
+      <button type="button" class="chat-chip" data-q="Tóm tắt chiến lược của signal này.">Tóm tắt chiến lược</button>
+    </div>
+    <div class="chat-input-row">
+      <input type="text" id="chatInput" placeholder="Ask about this signal…" maxlength="1000" autocomplete="off" />
+      <button type="button" id="chatSend" class="btn">Send</button>
+      <button type="button" id="chatClear" class="btn secondary" title="Clear conversation">Clear</button>
+    </div>
+  </aside>
+
+  <div id="toast" class="toast"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

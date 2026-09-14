@@ -11,5 +11,9 @@ build
 dist
 results
 eval_results
+data
+*.db
+tests
+*.log
 Dockerfile
 docker-compose.yml

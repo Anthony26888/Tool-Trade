@@ -1,36 +1,28 @@
 services:
-  tradingagents:
+  # Single container running BOTH the daemon (AI 1H analysis, TP/SL 1m
+  # monitoring, demo ledger) and the web dashboard. Provider / model / API key
+  # are driven exclusively by `.env` (database settings saved on the Dashboard
+  # Settings page take precedence once you change anything there).
+  signalengine:
     build: .
     env_file:
       - .env
+    ports:
+      - "8000:8000"
     volumes:
-      - tradingagents_data:/home/appuser/.tradingagents
-    tty: true
-    stdin_open: true
-
-  ollama:
-    image: ollama/ollama:latest
-    volumes:
-      - ollama_data:/root/.ollama
-    profiles:
-      - ollama
-
-  tradingagents-ollama:
-    build: .
-    env_file:
-      - .env
-    environment:
-      - TRADINGAGENTS_LLM_PROVIDER=ollama
-      - OLLAMA_BASE_URL=http://ollama:11434/v1
-    volumes:
-      - tradingagents_data:/home/appuser/.tradingagents
-    depends_on:
-      - ollama
-    tty: true
-    stdin_open: true
-    profiles:
-      - ollama
+      # SQLite ledger + secrets file (`/app/data`) survive rebuilds/restarts.
+      - btcusdt_data:/app/data
+    restart: unless-stopped
+    # Lets the container reach an Ollama installed on the HOST server at
+    # http://host.docker.internal:11434 (OLLAMA_HOST must be 0.0.0.0 there).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
 
 volumes:
-  tradingagents_data:
-  ollama_data:
+  btcusdt_data:
