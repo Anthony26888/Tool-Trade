@@ -89,7 +89,7 @@ function renderHealth(health) {
     <div class="kv"><span>monitor</span><span>${pill(health.monitor, health.monitor === "RUNNING")}</span></div>
     ${health.scheduler_last_tick ? `<div class="kv"><span>last tick</span><span>${health.scheduler_last_tick}</span></div>` : ""}
     ${health.monitor_last_poll ? `<div class="kv"><span>last poll</span><span>${health.monitor_last_poll}</span></div>` : ""}
-    ${health.last_error ? `<div class="kv"><span>last error</span><span>${health.last_error}</span></div>` : ""}`;
+    ${health.last_error ? `<div class="kv"><span>last error</span><span>${escapeHtml(health.last_error)}${health.last_error_at ? ` <span class="hint" style="color:var(--muted)">(${fmtVn(health.last_error_at)})</span>` : ""}</span></div>` : ""}`;
   return `<div class="form" style="gap:2px">${rows}</div>`;
 }
 
@@ -865,6 +865,19 @@ function renderSymbolForm(sym) {
       if (current === "dashboard") refresh("dashboard");
     } catch (err) {
       toast("Symbol save failed: " + err.message, "error");
+    }
+  });
+
+  $("#clearErrorBtn").addEventListener("click", async () => {
+    if (!confirm("Clear the stored \"last error\" shown in System Health?")) return;
+    try {
+      const result = await api("/api/runtime/clear-error", { method: "POST" });
+      toast("Last error cleared.");
+      const h = result.health || {};
+      $("#systemHealth").innerHTML = renderHealth(h);
+      if (current === "dashboard") refresh("dashboard");
+    } catch (err) {
+      toast("Clear failed: " + err.message, "error");
     }
   });
 }

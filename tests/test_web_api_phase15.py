@@ -158,7 +158,7 @@ class WebApiTestCase(unittest.TestCase):
     def test_health_endpoint(self):
         _, data = self.get_json("/api/health")
         health = data["health"]
-        for key in ("state", "scheduler", "monitor", "scheduler_last_tick", "monitor_last_poll", "last_error"):
+        for key in ("state", "scheduler", "monitor", "scheduler_last_tick", "monitor_last_poll", "last_error", "last_error_at"):
             self.assertIn(key, health)
 
     def test_health_with_daemon_heartbeats_is_recent(self):
@@ -171,6 +171,20 @@ class WebApiTestCase(unittest.TestCase):
         _, data = self.get_json("/api/health")
         self.assertEqual(data["health"]["scheduler"], "RUNNING")
         self.assertEqual(data["health"]["monitor"], "RUNNING")
+
+    def test_post_clear_last_error(self):
+        repo = RuntimeStateRepository(self.db)
+        repo.set("runtime.last_error", "stale boom")
+        repo.set("runtime.last_error_at", "2026-09-15T00:00:00Z")
+        status, raw = _request(
+            self.base + "/api/runtime/clear-error", method="POST", body={}
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(raw)
+        self.assertEqual(data["health"]["last_error"], "")
+        self.assertEqual(data["health"]["last_error_at"], "")
+        self.assertEqual(repo.get("runtime.last_error"), "")
+        self.assertEqual(repo.get("runtime.last_error_at"), "")
 
     def test_dashboard_lazily_creates_demo_account(self):
         # No account exists and the daemon never ran: the dashboard must
@@ -834,6 +848,20 @@ class ChartApiTestCase(unittest.TestCase):
             '"/api/demo/reset"',
             "Reset Demo Account",
             "fresh start",
+        ):
+            self.assertIn(marker, raw)
+
+    def test_static_contains_clear_last_error_ui(self):
+        status, raw = _request(self.base + "/")
+        self.assertEqual(status, 200)
+        for marker in ('id="clearErrorBtn"', "Clear last error"):
+            self.assertIn(marker, raw)
+        status, raw = _request(self.base + "/static/app.js")
+        self.assertEqual(status, 200)
+        for marker in (
+            "clearErrorBtn",
+            '"/api/runtime/clear-error"',
+            "Clear the stored",
         ):
             self.assertIn(marker, raw)
 

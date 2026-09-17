@@ -116,6 +116,7 @@ RUNTIME_KEY_STARTED_AT = "runtime.started_at"
 RUNTIME_KEY_SCHEDULER_LAST_TICK = "scheduler.last_tick"
 RUNTIME_KEY_MONITOR_LAST_POLL = "monitor.last_poll"
 RUNTIME_KEY_LAST_ERROR = "runtime.last_error"
+RUNTIME_KEY_LAST_ERROR_AT = "runtime.last_error_at"
 
 #: ``state`` lifecycle values in runtime_state.
 RUNTIME_STATE_RUNNING = "running"
@@ -587,6 +588,10 @@ class Runtime:
     def _record_error(self, message: str) -> None:
         try:
             self.state_store.set(RUNTIME_KEY_LAST_ERROR, str(message))
+            self.state_store.set(
+                RUNTIME_KEY_LAST_ERROR_AT,
+                datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            )
         except Exception as exc:  # pragma: no cover - defensive boundary
             logger.warning("[Runtime] could not record error state: %s", exc)
 
@@ -594,6 +599,7 @@ class Runtime:
         """Drop a stale last-error entry after a successful pass/position open."""
         try:
             self.state_store.set(RUNTIME_KEY_LAST_ERROR, "")
+            self.state_store.set(RUNTIME_KEY_LAST_ERROR_AT, "")
         except Exception as exc:  # pragma: no cover - defensive boundary
             logger.warning("[Runtime] could not clear error state: %s", exc)
 
@@ -644,6 +650,7 @@ def health_from_snapshot(
         "monitor": monitor_running,
         "monitor_last_poll": monitor_last,
         "last_error": snapshot.get(RUNTIME_KEY_LAST_ERROR),
+        "last_error_at": snapshot.get(RUNTIME_KEY_LAST_ERROR_AT),
     }
 
 
@@ -807,6 +814,7 @@ __all__ = [
     "ENV_SYMBOL",
     "ENV_TIMEFRAME",
     "RUNTIME_KEY_LAST_ERROR",
+    "RUNTIME_KEY_LAST_ERROR_AT",
     "RUNTIME_KEY_MONITOR_LAST_POLL",
     "RUNTIME_KEY_PID",
     "RUNTIME_KEY_SCHEDULER_LAST_TICK",

@@ -33,6 +33,7 @@ from signal_engine.__main__ import main
 from signal_engine.config import ConfigService
 from signal_engine.runtime import (
     RUNTIME_KEY_LAST_ERROR,
+    RUNTIME_KEY_LAST_ERROR_AT,
     RUNTIME_KEY_MONITOR_LAST_POLL,
     RUNTIME_KEY_PID,
     RUNTIME_KEY_SCHEDULER_LAST_TICK,
@@ -215,6 +216,7 @@ class TestHealth(unittest.TestCase):
         self.assertEqual(health["scheduler"], "STOPPED")
         self.assertEqual(health["monitor"], "STOPPED")
         self.assertIsNone(health["last_error"])
+        self.assertIsNone(health["last_error_at"])
 
 
 def _runtime(tmp: TempDb, *, md, notifier, analyzer_decision="LONG", config=None):
@@ -471,10 +473,13 @@ class TestLastErrorClear(unittest.TestCase):
         analyzer, _ = _make_analyzer("WAIT")
         runtime, _ = self._runtime_with(analyzer)
         runtime._record_error("stale gemma 429 boom")
+        store = RuntimeStateRepository(self._tmp.db)
+        self.assertNotEqual(store.get(RUNTIME_KEY_LAST_ERROR), "")
+        self.assertNotEqual(store.get(RUNTIME_KEY_LAST_ERROR_AT), "")
         summary = runtime.poll()
         self.assertNotEqual(summary["scheduler"], "ERROR")
-        store = RuntimeStateRepository(self._tmp.db)
         self.assertEqual(store.get(RUNTIME_KEY_LAST_ERROR), "")
+        self.assertEqual(store.get(RUNTIME_KEY_LAST_ERROR_AT), "")
 
     def test_entry_hit_clears_stale_error_on_open(self):
         analyzer, _ = _make_analyzer("LONG")
@@ -510,9 +515,11 @@ class TestLastErrorClear(unittest.TestCase):
         failed = runtime.poll()
         self.assertEqual(failed["scheduler"], "ERROR")
         self.assertIn("kaboom", store.get(RUNTIME_KEY_LAST_ERROR))
+        self.assertNotEqual(store.get(RUNTIME_KEY_LAST_ERROR_AT), "")
         ok = runtime.poll()
         self.assertNotEqual(ok["scheduler"], "ERROR")
         self.assertEqual(store.get(RUNTIME_KEY_LAST_ERROR), "")
+        self.assertEqual(store.get(RUNTIME_KEY_LAST_ERROR_AT), "")
 
 
 @pytest.mark.unit

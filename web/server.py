@@ -20,6 +20,7 @@ JSON API (all responses are ``application/json`` with ``ok`` envelope):
     GET  /api/settings/ollama/models?base_url=... -> installed Ollama models
     POST /api/settings/test-telegram        -> send a test Telegram message
     POST /api/demo/reset                    -> reset demo account to fresh start
+    POST /api/runtime/clear-error           -> clear the stored last-error state
                                                (balance=equity=peak=initial_balance,
                                                clear positions/trades; 409 while active)
     DELETE /api/signals             -> delete signals by {"ids":[...]} or
@@ -72,6 +73,8 @@ from signal_engine.config import (
 )
 from signal_engine.llm import LLMConfigError, build_llm_client
 from signal_engine.runtime import (
+    RUNTIME_KEY_LAST_ERROR,
+    RUNTIME_KEY_LAST_ERROR_AT,
     RuntimeConfig,
     _jsonable,
     health_from_snapshot,
@@ -245,6 +248,13 @@ class WebApplication:
             scheduler_poll=self.config.scheduler_poll,
             monitor_poll=self.config.monitor_poll,
         )
+
+    def clear_last_error(self) -> dict[str, Any]:
+        """Clear the stored ``last_error``/``last_error_at`` runtime state."""
+        repo = RuntimeStateRepository(self.database)
+        repo.set(RUNTIME_KEY_LAST_ERROR, "")
+        repo.set(RUNTIME_KEY_LAST_ERROR_AT, "")
+        return {"health": self.health()}
 
     def dashboard(self) -> dict[str, Any]:
         account = self._demo_account()
@@ -710,6 +720,8 @@ class _JsonHandler(BaseHTTPRequestHandler):
                 self._ok({"result": self.app.config_service.test_telegram()})
             elif parsed.path == "/api/demo/reset":
                 self._ok({"settings": self.app.config_service.reset_demo_account()})
+            elif parsed.path == "/api/runtime/clear-error":
+                self._ok(self.app.clear_last_error())
             elif parsed.path == "/api/signal-chat":
                 self._stream_signal_chat(self._read_body())
             else:

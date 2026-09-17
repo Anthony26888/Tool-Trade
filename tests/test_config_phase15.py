@@ -14,6 +14,7 @@ import json
 import os
 import stat
 import tempfile
+import time
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -95,6 +96,65 @@ def test_secret_store_persists_with_0600_perms(cfg):
     assert mode & 0o777 == 0o600
     reloaded = SecretStore(cfg.secrets_path, env={})
     assert reloaded.get(SECRET_API_KEY) == "sk-super-secret"
+
+
+@pytest.mark.unit
+def test_secret_store_refreshes_cache_across_instances(cfg):
+    # The web dashboard and the daemon run as separate processes with their own
+    # SecretStore. A key saved by one instance (stale in the other) must be
+    # picked up on the next ``get`` without a restart (regression for the
+    # OpenRouter 401 "Missing Authentication header").
+    daemon_store = SecretStore(cfg.secrets_path, env={})
+    daemon_store.get(SECRET_API_KEY)  # prime the cache
+    assert daemon_store.get(SECRET_API_KEY) is None
+
+    web_store = SecretStore(cfg.secrets_path, env={})
+    web_store.set(SECRET_API_KEY, "sk-picked-up")
+
+    assert daemon_store.get(SECRET_API_KEY) == "sk-picked-up"
+
+
+@pytest.mark.unit
+def test_secret_store_serves_cache_until_file_changes(cfg):
+    store = SecretStore(cfg.secrets_path, env={})
+    store.set(SECRET_API_KEY, "sk-unchanged")
+    store.get(SECRET_API_KEY)  # cache warmed
+
+    with open(cfg.secrets_path, encoding="utf-8") as handle:
+        content = handle.read()
+    original_mtime = os.stat(cfg.secrets_path).st_mtime
+    time.sleep(0.02)
+    # Rewrite identical bytes while advancing the mtime by hand so the file
+    # visibly changed but the value did not.
+    os.utime(cfg.secrets_path, (original_mtime + 5, original_mtime + 5))
+    assert os.stat(cfg.secrets_path).st_mtime != original_mtime
+    # mtime changed -> reload; identical content -> same value returned.
+    assert store.get(SECRET_API_KEY) == "sk-unchanged"
+    with open(cfg.secrets_path, encoding="utf-8") as handle:
+        assert content == handle.read()
+
+
+@pytest.mark.unit
+def test_secret_store_cache_hit_does_not_stat_when_warm(cfg):
+    # Sanity: while the mtime is unchanged the value is served from cache and
+    # a second store on the same path sees the same content.
+    SecretStore(cfg.secrets_path, env={}).set(SECRET_API_KEY, "sk-first")
+    store = SecretStore(cfg.secrets_path, env={})
+    assert store.get(SECRET_API_KEY) == "sk-first"
+    assert store.get(SECRET_API_KEY) == "sk-first"
+
+
+@pytest.mark.unit
+def test_secret_store_deleted_file_returns_none(cfg):
+    store = SecretStore(cfg.secrets_path, env={})
+    store.set(SECRET_API_KEY, "sk-gone")
+    assert store.get(SECRET_API_KEY) == "sk-gone"
+
+    os.remove(cfg.secrets_path)
+    assert store.get(SECRET_API_KEY) is None
+    # A later write through a fresh instance recreates the file cleanly.
+    SecretStore(cfg.secrets_path, env={}).set(SECRET_API_KEY, "sk-back")
+    assert os.path.exists(cfg.secrets_path)
 
 
 @pytest.mark.unit
@@ -249,6 +309,30 @@ def test_resolve_injects_stored_api_key(cfg):
         {"provider": "api", "preset": "deepseek", "model": "deepseek-chat", "api_key": "sk-live-key"}
     )
     assert cfg.service.resolve_llm_config().api_key == "sk-live-key"
+
+
+@pytest.mark.unit
+def test_resolve_picks_up_api_key_saved_by_another_instance(cfg):
+    # Regression for OpenRouter 401 "Missing Authentication header": the web
+    # dashboard and the scheduler daemon are separate processes with separate
+    # ConfigService/SecretStore instances. A key saved through the Settings
+    # page must reach the analysis pipeline WITHOUT a daemon restart.
+    daemon = ConfigService(cfg.db, secrets_path=cfg.secrets_path, env={})
+    daemon.resolve_llm_config()  # daemon started with no key saved yet
+    assert daemon.resolve_llm_config().api_key is None
+
+    web = ConfigService(cfg.db, secrets_path=cfg.secrets_path, env={})
+    web.update_ai_provider(
+        {
+            "provider": "api",
+            "preset": "deepseek",
+            "model": "deepseek-chat",
+            "api_key": "sk-daemon-picks-up",
+        }
+    )
+    resolved = daemon.resolve_llm_config()
+    assert resolved.provider == "deepseek"
+    assert resolved.api_key == "sk-daemon-picks-up"
 
 
 @pytest.mark.unit

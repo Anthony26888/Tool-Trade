@@ -186,13 +186,29 @@ class SecretStore:
             path or self.env.get(ENV_SECRETS_FILE) or DEFAULT_SECRETS_FILE
         )
         self._cache: dict[str, str] | None = None
+        self._cache_mtime: float | None = None
 
-    def _load(self) -> dict[str, str]:
-        if self._cache is not None:
-            return self._cache
-        if not os.path.exists(self.path):
+    def _refresh_if_changed(self) -> None:
+        """Reload the secrets file when it changed on disk (writes).
+
+        The web dashboard and the scheduler daemon run as separate processes
+        and each owns its own :class:`SecretStore`; ``set`` on one instance
+        must be observable by the other on the next ``get`` (e.g. an API key
+        saved through the Settings page reaching the analysis pipeline without
+        a container restart). The cached value is only served while the file's
+        mtime is unchanged, so a stale in-memory copy never leaks through.
+        """
+        try:
+            stat = os.stat(self.path)
+            mtime = stat.st_mtime
+        except OSError:
+            mtime = None
+        if self._cache is not None and mtime == self._cache_mtime:
+            return
+        self._cache_mtime = mtime
+        if mtime is None:
             self._cache = {}
-            return self._cache
+            return
         try:
             with open(self.path, encoding="utf-8") as handle:
                 data = json.load(handle)
@@ -200,19 +216,20 @@ class SecretStore:
         except (OSError, ValueError):
             logger.warning("[Config] could not read secrets file %s", self.path)
             self._cache = {}
-        return self._cache
 
     def configured(self, key: str) -> bool:
         return bool(self.get(key))
 
     def get(self, key: str) -> str | None:
-        value = self._load().get(key)
+        self._refresh_if_changed()
+        value = self._cache.get(key)
         return value if value else None
 
     def set(self, key: str, value: str) -> None:
         if not key or not value:
             return
-        data = self._load()
+        self._refresh_if_changed()
+        data = dict(self._cache or {})
         data[key] = value
         parent = os.path.dirname(self.path)
         if parent:
@@ -223,6 +240,10 @@ class SecretStore:
                 json.dump(data, handle, indent=2, sort_keys=True)
         finally:
             self._cache = data
+            try:
+                self._cache_mtime = os.stat(self.path).st_mtime
+            except OSError:  # pragma: no cover - file was just written
+                self._cache_mtime = None
 
 
 # -- AI provider settings ----------------------------------------------------------
