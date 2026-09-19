@@ -281,6 +281,40 @@ _SCHEMA_TABLES: tuple[str, ...] = (
         created_at TEXT NOT NULL
     )
     """,
+    # Phase 16: one diagnostic row per analysed 1H candle, explaining why the
+    # daemon produced LONG/SHORT/WAIT or skipped the candle (AI locked, data
+    # unavailable, LLM error). Upserted per (symbol, timeframe, candle open
+    # time), so each candle keeps exactly one row even when a tick retries.
+    # Purely diagnostic: it never gates or feeds trading logic.
+    """
+    CREATE TABLE IF NOT EXISTS candle_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT NOT NULL,
+        timeframe TEXT NOT NULL,
+        candle_timestamp_ms INTEGER NOT NULL,
+        closed_at TEXT,
+        recorded_at TEXT NOT NULL,
+        outcome TEXT NOT NULL,
+        decision TEXT CHECK (decision IS NULL OR decision IN ('LONG', 'SHORT', 'WAIT', 'NONE')),
+        confidence INTEGER CHECK (confidence IS NULL OR confidence BETWEEN 0 AND 100),
+        entry TEXT,
+        stop_loss TEXT,
+        take_profit TEXT,
+        close_price TEXT,
+        signal_id INTEGER REFERENCES signals(id),
+        provider TEXT,
+        model TEXT,
+        temperature TEXT,
+        reasoning TEXT,
+        error_notes TEXT,
+        indicators_json TEXT,
+        llm_calls INTEGER,
+        prompt_tokens INTEGER,
+        completion_tokens INTEGER,
+        total_tokens INTEGER,
+        UNIQUE (symbol, timeframe, candle_timestamp_ms)
+    )
+    """,
 )
 
 _SCHEMA_INDEXES: tuple[str, ...] = (
@@ -302,6 +336,8 @@ _SCHEMA_INDEXES: tuple[str, ...] = (
     # existed), so a UNIQUE index cannot collide with legacy rows.
     "CREATE UNIQUE INDEX IF NOT EXISTS uq_demo_positions_signal ON demo_positions(signal_id)",
     "CREATE UNIQUE INDEX IF NOT EXISTS uq_demo_trades_signal ON demo_trades(signal_id)",
+    "CREATE INDEX IF NOT EXISTS idx_candle_log_candle ON candle_log(symbol, timeframe, candle_timestamp_ms)",
+    "CREATE INDEX IF NOT EXISTS idx_candle_log_recorded_at ON candle_log(recorded_at)",
 )
 
 _SCHEMA_STATEMENTS: tuple[str, ...] = (*_SCHEMA_TABLES, *_SCHEMA_INDEXES)
@@ -309,7 +345,7 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (*_SCHEMA_TABLES, *_SCHEMA_INDEXES)
 # Additive, data-preserving migrations for databases created before a column
 # existed. ``CREATE TABLE IF NOT EXISTS`` cannot add columns to an existing
 # table, so opening an older database must ALTER the table instead. All entries
-# are nullable TEXT columns, so existing rows are never rewritten.
+# are nullable columns, so existing rows are never rewritten.
 _ADDITIVE_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("signals", "analysis_timestamp", "TEXT"),
     ("signals", "market_timestamp", "TEXT"),
@@ -319,10 +355,20 @@ _ADDITIVE_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("demo_accounts", "peak_equity", "TEXT"),
     # Phase 15: the sampling temperature used to produce a signal (metadata).
     ("signals", "temperature", "TEXT"),
+    # Quota audit: per-candle LLM usage (calls always recorded; token counts
+    # best-effort and NULL when the provider path drops the metadata).
+    ("candle_log", "llm_calls", "INTEGER"),
+    ("candle_log", "prompt_tokens", "INTEGER"),
+    ("candle_log", "completion_tokens", "INTEGER"),
+    ("candle_log", "total_tokens", "INTEGER"),
 )
 
 _TRANSITION_COLUMNS = ("created_at", "opened_at", "closed_at")
 _ORDER_COLUMNS = frozenset(_TRANSITION_COLUMNS) | {"id"}
+
+#: Phase 16: how many diagnostic candle-log rows to keep (one row per analysed
+#: 1H candle ≈ 24/day). Older rows are pruned after each write.
+CANDLE_LOG_RETENTION = 2000
 
 
 def iso_utc_now() -> str:
@@ -1527,6 +1573,318 @@ class DemoRepository:
             else:
                 row = conn.execute("SELECT COUNT(*) AS n FROM demo_trades").fetchone()
         return int(row["n"])
+
+
+class CandleLogEntry:
+    """One diagnostic row of the per-candle daemon activity log (Phase 16)."""
+
+    __slots__ = (
+        "id",
+        "symbol",
+        "timeframe",
+        "candle_timestamp_ms",
+        "closed_at",
+        "recorded_at",
+        "outcome",
+        "decision",
+        "confidence",
+        "entry",
+        "stop_loss",
+        "take_profit",
+        "close_price",
+        "signal_id",
+        "provider",
+        "model",
+        "temperature",
+        "reasoning",
+        "error_notes",
+        "indicators_json",
+        "llm_calls",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+    )
+
+    def __init__(
+        self,
+        *,
+        id: int | None,
+        symbol: str,
+        timeframe: str,
+        candle_timestamp_ms: int,
+        closed_at: str | None,
+        recorded_at: str,
+        outcome: str,
+        decision: str | None,
+        confidence: int | None,
+        entry: str | None,
+        stop_loss: str | None,
+        take_profit: str | None,
+        close_price: str | None,
+        signal_id: int | None,
+        provider: str | None,
+        model: str | None,
+        temperature: str | None,
+        reasoning: str | None,
+        error_notes: str | None,
+        indicators_json: str | None,
+        llm_calls: int | None,
+        prompt_tokens: int | None,
+        completion_tokens: int | None,
+        total_tokens: int | None,
+    ) -> None:
+        self.id = id
+        self.symbol = symbol
+        self.timeframe = timeframe
+        self.candle_timestamp_ms = candle_timestamp_ms
+        self.closed_at = closed_at
+        self.recorded_at = recorded_at
+        self.outcome = outcome
+        self.decision = decision
+        self.confidence = confidence
+        self.entry = entry
+        self.stop_loss = stop_loss
+        self.take_profit = take_profit
+        self.close_price = close_price
+        self.signal_id = signal_id
+        self.provider = provider
+        self.model = model
+        self.temperature = temperature
+        self.reasoning = reasoning
+        self.error_notes = error_notes
+        self.indicators_json = indicators_json
+        self.llm_calls = llm_calls
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+        self.total_tokens = total_tokens
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> CandleLogEntry:
+        return cls(
+            id=int(row["id"]),
+            symbol=row["symbol"],
+            timeframe=row["timeframe"],
+            candle_timestamp_ms=int(row["candle_timestamp_ms"]),
+            closed_at=row["closed_at"],
+            recorded_at=row["recorded_at"],
+            outcome=row["outcome"],
+            decision=row["decision"],
+            confidence=row["confidence"],
+            entry=row["entry"],
+            stop_loss=row["stop_loss"],
+            take_profit=row["take_profit"],
+            close_price=row["close_price"],
+            signal_id=row["signal_id"],
+            provider=row["provider"],
+            model=row["model"],
+            temperature=row["temperature"],
+            reasoning=row["reasoning"],
+            error_notes=row["error_notes"],
+            indicators_json=row["indicators_json"],
+            llm_calls=row["llm_calls"],
+            prompt_tokens=row["prompt_tokens"],
+            completion_tokens=row["completion_tokens"],
+            total_tokens=row["total_tokens"],
+        )
+
+
+class CandleLogRepository:
+    """Per-candle daemon activity log (Phase 16).
+
+    Stores one upserted row per ``(symbol, timeframe, candle open time)`` so
+    every analysed 1H candle keeps a single, stable entry even when a tick
+    retries the same candle (errors) or the AI stays locked across polls. The
+    log is diagnostic only: it never influences signals, positions, or trades.
+    """
+
+    def __init__(self, database: Database) -> None:
+        self.database = database
+
+    def upsert(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        candle_timestamp_ms: int,
+        outcome: str,
+        recorded_at: str | None = None,
+        closed_at: str | None = None,
+        decision: str | None = None,
+        confidence: int | None = None,
+        entry: Any = None,
+        stop_loss: Any = None,
+        take_profit: Any = None,
+        close_price: Any = None,
+        signal_id: int | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        temperature: Any = None,
+        reasoning: str | None = None,
+        error_notes: str | None = None,
+        indicators_json: str | None = None,
+        llm_calls: int | None = None,
+        prompt_tokens: int | None = None,
+        completion_tokens: int | None = None,
+        total_tokens: int | None = None,
+    ) -> None:
+        """Insert or replace the diagnostic row for one candle.
+
+        Prices/temperature are normalized to their TEXT form (like signals);
+        ``decision`` is one of LONG/SHORT/WAIT/NONE for validated rows.
+        Quota counters (``llm_calls`` etc.) must be non-negative integers;
+        token counts are best-effort and stay NULL when the provider path
+        drops the usage metadata.
+        """
+        if not isinstance(candle_timestamp_ms, int) or candle_timestamp_ms <= 0:
+            raise SignalValidationError(
+                "candle_timestamp_ms must be a positive integer"
+            )
+        if not outcome:
+            raise SignalValidationError("outcome must be a non-empty string")
+        confidence_int = None
+        if confidence is not None:
+            if isinstance(confidence, bool) or not isinstance(confidence, int):
+                raise SignalValidationError("confidence must be an integer")
+            if not 0 <= confidence <= 100:
+                raise SignalValidationError("confidence must be between 0 and 100")
+            confidence_int = confidence
+        quota: dict[str, int | None] = {}
+        for field, value in (
+            ("llm_calls", llm_calls),
+            ("prompt_tokens", prompt_tokens),
+            ("completion_tokens", completion_tokens),
+            ("total_tokens", total_tokens),
+        ):
+            if value is None:
+                quota[field] = None
+            elif isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise SignalValidationError(
+                    f"{field} must be a non-negative integer"
+                )
+            else:
+                quota[field] = value
+        temperature_text = _temperature_to_text(temperature) if temperature is not None else None
+        entry_text = _optional_price(str(entry), entry)
+        stop_text = _optional_price(str(stop_loss), stop_loss)
+        take_text = _optional_price(str(take_profit), take_profit)
+        close_text = _optional_price(str(close_price), close_price)
+        recorded = recorded_at if recorded_at is not None else iso_utc_now()
+        with self.database.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO candle_log (
+                    symbol, timeframe, candle_timestamp_ms, closed_at,
+                    recorded_at, outcome, decision, confidence, entry,
+                    stop_loss, take_profit, close_price, signal_id, provider,
+                    model, temperature, reasoning, error_notes, indicators_json,
+                    llm_calls, prompt_tokens, completion_tokens, total_tokens
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol, timeframe, candle_timestamp_ms)
+                DO UPDATE SET
+                    closed_at = excluded.closed_at,
+                    recorded_at = excluded.recorded_at,
+                    outcome = excluded.outcome,
+                    decision = excluded.decision,
+                    confidence = excluded.confidence,
+                    entry = excluded.entry,
+                    stop_loss = excluded.stop_loss,
+                    take_profit = excluded.take_profit,
+                    close_price = excluded.close_price,
+                    signal_id = excluded.signal_id,
+                    provider = excluded.provider,
+                    model = excluded.model,
+                    temperature = excluded.temperature,
+                    reasoning = excluded.reasoning,
+                    error_notes = excluded.error_notes,
+                    indicators_json = excluded.indicators_json,
+                    llm_calls = excluded.llm_calls,
+                    prompt_tokens = excluded.prompt_tokens,
+                    completion_tokens = excluded.completion_tokens,
+                    total_tokens = excluded.total_tokens
+                """,
+                (
+                    validate_symbol(symbol),
+                    validate_interval(timeframe),
+                    int(candle_timestamp_ms),
+                    closed_at,
+                    recorded,
+                    outcome,
+                    decision,
+                    confidence_int,
+                    entry_text,
+                    stop_text,
+                    take_text,
+                    close_text,
+                    signal_id,
+                    provider,
+                    model,
+                    temperature_text,
+                    reasoning,
+                    error_notes,
+                    indicators_json,
+                    quota["llm_calls"],
+                    quota["prompt_tokens"],
+                    quota["completion_tokens"],
+                    quota["total_tokens"],
+                ),
+            )
+            conn.execute(
+                "DELETE FROM candle_log WHERE id NOT IN "
+                "(SELECT id FROM candle_log ORDER BY id DESC LIMIT ?)",
+                (int(CANDLE_LOG_RETENTION),),
+            )
+
+    def list(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        decision: str | None = None,
+        symbol: str | None = None,
+        timeframe: str | None = None,
+    ) -> list[CandleLogEntry]:
+        """Read the log newest-first; optional ``decision``/symbol/timeframe filters."""
+        if limit < 0 or offset < 0:
+            raise SignalValidationError("limit and offset must be non-negative")
+        clauses: list[str] = []
+        params: list[Any] = []
+        if decision is not None:
+            if decision not in ("LONG", "SHORT", "WAIT", "NONE"):
+                raise SignalValidationError("decision must be one of LONG/SHORT/WAIT/NONE")
+            clauses.append("decision = ?")
+            params.append(decision)
+        if symbol is not None:
+            clauses.append("symbol = ?")
+            params.append(validate_symbol(symbol))
+        if timeframe is not None:
+            clauses.append("timeframe = ?")
+            params.append(validate_interval(timeframe))
+        where = " AND ".join(clauses) if clauses else "1"
+        params.extend([limit, offset])
+        with self.database.read() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM candle_log WHERE {where} "
+                "ORDER BY id DESC LIMIT ? OFFSET ?",
+                params,
+            ).fetchall()
+        return [CandleLogEntry.from_row(row) for row in rows]
+
+    def clear(self) -> int:
+        """Delete every candle-log row; returns how many were removed."""
+        with self.database.transaction() as conn:
+            cursor = conn.execute("DELETE FROM candle_log")
+        return int(cursor.rowcount)
+
+
+def _optional_price(value: Any, raw: Any) -> str | None:
+    """Normalize an optional candle-log price to its TEXT form, or None."""
+    if raw is None or str(raw).strip() in ("", "None"):
+        return None
+    try:
+        decimal_value = to_decimal(raw, "price")
+    except SignalValidationError:
+        return str(raw)
+    return str(decimal_value)
 
 
 class RuntimeStateRepository:

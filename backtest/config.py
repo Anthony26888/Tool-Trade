@@ -26,11 +26,12 @@ from demo.account import (
     DEFAULT_INITIAL_BALANCE,
     DEFAULT_LEVERAGE,
     DEFAULT_MARGIN_PER_TRADE,
+    DEFAULT_RISK_PERCENT,
 )
 
 #: How many most-recent closed candles a decision provider is shown. Mirrors
 #: the Phase 5 context look-back so a real analyzer can be plugged in as-is.
-DEFAULT_MAX_CANDLES = 40
+DEFAULT_MAX_CANDLES = 20
 
 #: The default decision (analysis) timeframe for a backtest.
 DEFAULT_DECISION_TIMEFRAME = "1h"
@@ -121,6 +122,7 @@ class BacktestConfig:
     initial_balance: Decimal = DEFAULT_INITIAL_BALANCE
     margin_per_trade: Decimal = DEFAULT_MARGIN_PER_TRADE
     leverage: int = DEFAULT_LEVERAGE
+    risk_percent: Decimal = DEFAULT_RISK_PERCENT
     fee_rate: Decimal = DEFAULT_FEE_RATE
     slippage_bps: Decimal = Decimal("0")
     funding_rates: Mapping[int, Decimal] | None = None
@@ -158,6 +160,7 @@ def validate_config(config: BacktestConfig) -> None:
         raise BacktestConfigError(str(exc)) from exc
     _positive(config.initial_balance, "initial_balance")
     _positive(config.margin_per_trade, "margin_per_trade")
+    _positive(config.risk_percent, "risk_percent")
     if isinstance(config.leverage, bool) or not isinstance(config.leverage, int):
         raise BacktestConfigError("leverage must be an integer")
     if config.leverage < 1:

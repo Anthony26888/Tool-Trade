@@ -51,7 +51,9 @@ from binance.market_data import (
 )
 from database.database import (
     DEFAULT_DB_PATH,
+    CandleLogRepository,
     Database,
+    DemoRepository,
     RuntimeStateRepository,
     SignalRepository,
     iso_utc_now,
@@ -62,6 +64,14 @@ from demo.position import DemoAccountRecord, DemoTrade
 
 from .analysis import analyze_signal
 from .config import ConfigService
+from .daily_report import (
+    REPORT_LAST_DAILY_KEY,
+    build_daily_report,
+    report_window,
+    should_send_daily,
+    vn_now,
+)
+from .event_calendar import EventCalendar
 from .llm import llm_config_from_env
 from .monitor import (
     AMBIGUITY_REASON_ENTRY,
@@ -92,6 +102,7 @@ DEFAULT_DEMO_MARGIN_PER_TRADE = Decimal("2")
 DEFAULT_DEMO_LEVERAGE = 10
 DEFAULT_DEMO_RISK_PERCENT = Decimal("1")
 DEFAULT_DEMO_FEE_RATE = Decimal("0.0004")
+DEFAULT_DEMO_SLIPPAGE_BPS = Decimal("0")
 
 #: Default wall-clock poll intervals for the two retryable subsystems.
 DEFAULT_SCHEDULER_POLL = DEFAULT_POLL_INTERVAL
@@ -108,6 +119,7 @@ ENV_DEMO_MARGIN_PER_TRADE = "BTCUSDT_DEMO_MARGIN_PER_TRADE"
 ENV_DEMO_LEVERAGE = "BTCUSDT_DEMO_LEVERAGE"
 ENV_DEMO_RISK_PERCENT = "BTCUSDT_DEMO_RISK_PERCENT"
 ENV_DEMO_FEE_RATE = "BTCUSDT_DEMO_FEE_RATE"
+ENV_DEMO_SLIPPAGE_BPS = "BTCUSDT_DEMO_SLIPPAGE_BPS"
 
 #: RuntimeStateRepository heartbeat keys.
 RUNTIME_KEY_STATE = "runtime.state"
@@ -232,6 +244,9 @@ def demo_config_from_env(env: dict | None = None):
             env, ENV_DEMO_RISK_PERCENT, DEFAULT_DEMO_RISK_PERCENT
         ),
         fee_rate=_env_decimal(env, ENV_DEMO_FEE_RATE, DEFAULT_DEMO_FEE_RATE),
+        slippage_bps=_env_decimal(
+            env, ENV_DEMO_SLIPPAGE_BPS, DEFAULT_DEMO_SLIPPAGE_BPS
+        ),
     )
 
 
@@ -309,6 +324,8 @@ class Runtime:
                 config=self.llm_env_config(),
                 analyzer=self._resolving_analyzer(),
                 notifier=self.notifier,
+                candle_log=CandleLogRepository(self.database),
+                event_calendar=EventCalendar(),
             )
         if monitor is None:
             monitor = SignalMonitor(
@@ -334,6 +351,9 @@ class Runtime:
         #: Signals whose OPEN notification was already emitted in this process
         #: (guards the race-loser re-read path from double-announcing).
         self._notified_opened: set[int] = set()
+        #: Monotonic deadline for the next daily-report eligibility check
+        #: (throttles the KV read to ~once a minute inside the hot loop).
+        self._report_check_at = 0.0
 
     # -- Startup recovery -------------------------------------------------------
 
@@ -511,6 +531,7 @@ class Runtime:
                 if now >= next_monitor:
                     self.poll_monitor()
                     next_monitor = time.monotonic() + self.config.monitor_poll
+                self._maybe_daily_report()
                 step = min(
                     max(0.01, next_scheduler - now),
                     max(0.01, next_monitor - now),
@@ -521,6 +542,60 @@ class Runtime:
             logger.info("[Runtime] daemon stopped")
 
     # -- Monitor outcome handling -------------------------------------------------
+
+    def _maybe_daily_report(self, now_utc: datetime | None = None) -> None:
+        """Send the 07:00 (+07) daily report once per VN day (never raises).
+
+        Throttled to ~one eligibility check per minute; the persisted
+        ``report.last_daily`` flag makes the send exactly-once across
+        restarts. Reports go to the notifier's default (reports) channel.
+        """
+        try:
+            now_mono = time.monotonic()
+            if now_mono < self._report_check_at:
+                return
+            self._report_check_at = now_mono + 60.0
+            now_utc = now_utc if now_utc is not None else datetime.now(timezone.utc)
+            last = self.state_store.get(REPORT_LAST_DAILY_KEY)
+            if not should_send_daily(last, now_utc):
+                return
+            if self.notifier is None:
+                return
+            start, end, label = report_window(now_utc)
+            signals = self.repository.list_signals(
+                created_since=start, created_until=end, limit=500
+            )
+            account = self.executor.account()
+            trades: list[DemoTrade] = []
+            balance = initial = None
+            if account is not None:
+                balance, initial = account.balance, account.initial_balance
+                demo_repo = DemoRepository(self.database)
+                for row in demo_repo.list_trades(account.id, limit=500):
+                    stamp = row["closed_at"]
+                    if isinstance(stamp, str) and start <= stamp < end:
+                        trades.append(DemoTrade.from_row(row))
+            candle_rows = [
+                row
+                for row in CandleLogRepository(self.database).list(limit=1500)
+                if start <= row.recorded_at < end
+            ]
+            text = build_daily_report(
+                signals=signals,
+                trades=trades,
+                candle_rows=candle_rows,
+                balance=balance,
+                initial_balance=initial,
+                last_error=self.state_store.get(RUNTIME_KEY_LAST_ERROR),
+                day_label=label,
+            )
+            self.notifier.send_message(text)
+            self.state_store.set(
+                REPORT_LAST_DAILY_KEY, vn_now(now_utc).date().strftime("%Y-%m-%d")
+            )
+            logger.info("[Runtime] daily report sent for VN day %s", label)
+        except Exception as exc:  # never break the daemon loop
+            logger.warning("[Runtime] daily report failed: %s", exc)
 
     def _handle_monitor_result(self, result: MonitorResult) -> None:
         """Drive demo accounting + user notifications from one monitor outcome.

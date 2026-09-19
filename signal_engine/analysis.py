@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -162,6 +164,47 @@ class SignalAnalysisError(Exception):
     """The LLM analysis failed or produced output that cannot be a signal."""
 
 
+class RateLimitedError(SignalAnalysisError):
+    """The LLM provider refused the call with a rate limit (HTTP 429 etc.).
+
+    Retrying the same candle on every poll would deepen the limit, so the
+    scheduler skips the candle instead of retrying it.
+    """
+
+
+#: Lowercased substrings identifying a provider rate-limit / capacity error.
+#: The LLM layer collapses transport errors to message strings (no status
+#: code), so classification is message-based by necessity.
+_RATE_LIMIT_HINTS = (
+    "429",
+    "rate limit",
+    "rate_limit",
+    "ratelimit",
+    "too many requests",
+    "quota",
+    "capacity",
+    "overloaded",
+)
+
+
+def _is_rate_limited(text: str) -> bool:
+    """Return True when an LLM failure message looks like a rate limit."""
+    lowered = text.lower()
+    return any(hint in lowered for hint in _RATE_LIMIT_HINTS)
+
+
+def _reset_hint(text: str) -> str:
+    """Extract a provider retry/reset hint (e.g. retry-after seconds)."""
+    match = re.search(
+        r"(?:retry[\s_-]?after|reset(?:\s+in)?|retry in)\s*[:=]?\s*(\d+)",
+        text,
+        re.IGNORECASE,
+    )
+    if match:
+        return f" (provider asks to retry after {match.group(1)}s)"
+    return ""
+
+
 def _bind_structured(llm: Any, schema: type[BaseModel], agent_name: str) -> Any | None:
     """Return ``llm.with_structured_output(schema)`` or ``None`` when unsupported.
 
@@ -246,6 +289,24 @@ class SignalAnalysis:
     closed_at: str
     candle_close_price: float
     temperature: float | None = None
+    #: ATR(14) of the analysis candle, threaded from the deterministic
+    #: indicator snapshot so Phase 6 guardrails can bound stop/take distances.
+    atr: float | None = None
+    #: Quota audit: LLM calls spent producing this analysis (1 single-call,
+    #: up to 5 for the multi-agent debate) plus best-effort token counts
+    #: (NULL when the provider path drops the usage metadata).
+    llm_calls: int = 1
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    #: Live Binance funding rate (/8h) at analysis time, threaded from the
+    #: Phase P1 positioning snapshot so the crowded-side guardrail can reject
+    #: entries leaning into an overcrowded side. None = unavailable = no check.
+    funding_rate: float | None = None
+    #: 4H regime ("UP"/"DOWN") threaded from the Phase P2 HTF bias so the
+    #: regime guardrail can veto counter-trend entries. None = unclear or
+    #: unavailable = no check.
+    regime: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -264,7 +325,62 @@ class SignalAnalysis:
             "closed_at": self.closed_at,
             "candle_close_price": self.candle_close_price,
             "temperature": self.temperature,
+            "atr": self.atr,
+            "llm_calls": self.llm_calls,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
+            "funding_rate": self.funding_rate,
+            "regime": self.regime,
         }
+
+
+def _snapshot_atr(context: AnalysisContext) -> float | None:
+    """Extract a finite ATR(14) from the analysis-candle snapshot, if any."""
+    try:
+        value = float(context.snapshot.atr14)
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return value if math.isfinite(value) and value > 0 else None
+
+
+def _extract_usage(response: Any) -> dict[str, int | None] | None:
+    """Best-effort token-usage extraction from a raw LLM response.
+
+    Provider metadata shapes differ (``response_metadata.token_usage`` on
+    OpenAI-compatible paths, ``usage_metadata`` elsewhere) and the
+    structured-output path drops the envelope entirely. Anything missing or
+    malformed yields NULL quota columns — never an exception.
+    """
+    try:
+        meta = getattr(response, "response_metadata", None) or {}
+        usage = dict(meta.get("token_usage") or {})
+        alt = getattr(response, "usage_metadata", None) or {}
+
+        def _pick(*keys: str) -> int | None:
+            for key in keys:
+                for source in (usage, alt):
+                    value = source.get(key)
+                    if isinstance(value, bool):
+                        continue
+                    if isinstance(value, int) and value >= 0:
+                        return value
+            return None
+
+        prompt = _pick("prompt_tokens", "input_tokens")
+        completion = _pick("completion_tokens", "output_tokens")
+        total = _pick("total_tokens")
+        if total is None and prompt is not None and completion is not None:
+            total = prompt + completion
+        if prompt is None and completion is None and total is None:
+            return None
+        return {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": total,
+        }
+    except Exception:
+        return None
 
 
 class SignalAnalyzer:
@@ -285,6 +401,11 @@ class SignalAnalyzer:
         symbol: str = "BTCUSDT",
         timeframe: str = "1h",
         max_candles: int = DEFAULT_MAX_CANDLES,
+        event_note: str | None = None,
+        positioning: str | None = None,
+        funding_rate: float | None = None,
+        htf_note: str | None = None,
+        regime: str | None = None,
     ) -> SignalAnalysis:
         """Analyse the latest closed candle and return a strictly parsed result.
 
@@ -299,12 +420,21 @@ class SignalAnalyzer:
             symbol=symbol,
             timeframe=timeframe,
             max_candles=max_candles,
+            event_note=event_note,
+            positioning=positioning,
+            htf_note=htf_note,
         )
-        decision_model = self._invoke(context)
-        return self._to_analysis(context, decision_model)
+        decision_model, usage = self._invoke(context)
+        return self._to_analysis(
+            context, decision_model, usage=usage, funding_rate=funding_rate,
+            regime=regime,
+        )
 
-    def _invoke(self, context: AnalysisContext) -> SignalDecisionModel:
+    def _invoke(
+        self, context: AnalysisContext
+    ) -> tuple[SignalDecisionModel, dict[str, int | None] | None]:
         prompt = build_prompt(context)
+        usage: dict[str, int | None] | None = None
         try:
             if self.structured_llm is not None:
                 raw = self.structured_llm.invoke(prompt)
@@ -314,16 +444,29 @@ class SignalAnalyzer:
                     )
             else:
                 response = self.llm.invoke(prompt)
+                usage = _extract_usage(response)
                 raw = getattr(response, "content", response)
         except SignalAnalysisError:
             raise
         except Exception as exc:
+            text = str(exc)
+            if _is_rate_limited(text):
+                raise RateLimitedError(
+                    f"LLM rate limit{_reset_hint(text)}: {exc}"
+                ) from exc
             raise SignalAnalysisError(f"LLM analysis failed: {exc}") from exc
-        return _coerce_decision(raw)
+        return _coerce_decision(raw), usage
 
     def _to_analysis(
-        self, context: AnalysisContext, model: SignalDecisionModel
+        self,
+        context: AnalysisContext,
+        model: SignalDecisionModel,
+        *,
+        usage: dict[str, int | None] | None = None,
+        funding_rate: float | None = None,
+        regime: str | None = None,
     ) -> SignalAnalysis:
+        usage = usage or {}
         return SignalAnalysis(
             decision=model.decision.value,
             confidence=float(model.confidence),
@@ -342,6 +485,13 @@ class SignalAnalyzer:
             closed_at=context.closed_at,
             candle_close_price=context.last_close,
             temperature=self.config.temperature,
+            atr=_snapshot_atr(context),
+            llm_calls=1,
+            prompt_tokens=usage.get("prompt_tokens"),
+            completion_tokens=usage.get("completion_tokens"),
+            total_tokens=usage.get("total_tokens"),
+            funding_rate=funding_rate,
+            regime=regime,
         )
 
 
@@ -355,6 +505,11 @@ def analyze_signal(
     symbol: str = "BTCUSDT",
     timeframe: str = "1h",
     max_candles: int = DEFAULT_MAX_CANDLES,
+    event_note: str | None = None,
+    positioning: str | None = None,
+    funding_rate: float | None = None,
+    htf_note: str | None = None,
+    regime: str | None = None,
 ) -> SignalAnalysis:
     """Convenience wrapper: build an analyzer and run a single analysis.
 
@@ -375,4 +530,9 @@ def analyze_signal(
         symbol=symbol,
         timeframe=timeframe,
         max_candles=max_candles,
+        event_note=event_note,
+        positioning=positioning,
+        funding_rate=funding_rate,
+        htf_note=htf_note,
+        regime=regime,
     )

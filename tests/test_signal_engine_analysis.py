@@ -23,6 +23,7 @@ from signal_engine import (
     CONFIDENCE_MIN,
     DECISIONS,
     LLMConfig,
+    RateLimitedError,
     SignalAnalysisError,
     SignalAnalyzer,
     SignalDecision,
@@ -30,6 +31,7 @@ from signal_engine import (
     analyze_signal,
     build_prompt,
 )
+from signal_engine.analysis import _extract_usage, _is_rate_limited, _reset_hint
 from signal_engine.context import build_analysis_context
 from tests.signal_engine_test_helpers import indicators_for, make_candles
 
@@ -168,6 +170,55 @@ class TestSignalAnalyzer(unittest.TestCase):
             SignalAnalyzer(CONFIG, llm=llm).analyze(candles, indicators)
         self.assertIn("LLM analysis failed", str(ctx.exception))
 
+    def test_rate_limit_failure_is_classified(self):
+        candles, indicators = _context_input()
+        llm, structured = _structured_llm(
+            side_effect=RuntimeError(
+                "Error code: 429 - rate limit exceeded, retry after 20"
+            )
+        )
+        with self.assertRaises(RateLimitedError) as ctx:
+            SignalAnalyzer(CONFIG, llm=llm).analyze(candles, indicators)
+        self.assertIn("retry after 20s", str(ctx.exception))
+
+    def test_non_rate_limit_failure_stays_generic(self):
+        candles, indicators = _context_input()
+        llm, structured = _structured_llm(
+            side_effect=RuntimeError("provider timeout")
+        )
+        with self.assertRaises(SignalAnalysisError) as ctx:
+            SignalAnalyzer(CONFIG, llm=llm).analyze(candles, indicators)
+        self.assertNotIsInstance(ctx.exception, RateLimitedError)
+
+    def test_rate_limit_hint_matching(self):
+        for text in (
+            "Error code: 429",
+            "Rate limit reached for free models",
+            "RATE_LIMIT exceeded",
+            "Too Many Requests",
+            "quota exceeded for the day",
+            "upstream provider at capacity",
+            "server overloaded, try again",
+        ):
+            self.assertTrue(_is_rate_limited(text), text)
+        for text in (
+            "provider timeout",
+            "connection reset by peer",
+            "500 internal server error",
+            "API key is not set",
+            "malformed JSON response",
+        ):
+            self.assertFalse(_is_rate_limited(text), text)
+
+    def test_reset_hint_extraction(self):
+        self.assertEqual(
+            _reset_hint("rate limit, retry after 45"), " (provider asks to retry after 45s)"
+        )
+        self.assertEqual(
+            _reset_hint("429: Retry-After: 120"), " (provider asks to retry after 120s)"
+        )
+        self.assertEqual(_reset_hint("provider timeout"), "")
+
     def test_structured_none_result_rejected(self):
         candles, indicators = _context_input()
         llm, structured = _structured_llm(model=None)
@@ -209,6 +260,42 @@ class TestSignalAnalyzer(unittest.TestCase):
         self.assertIsNone(analyzer.structured_llm)
         result = analyzer.analyze(candles, indicators)
         self.assertEqual(result.decision, "LONG")
+
+    def test_quota_single_call_and_usage_from_metadata(self):
+        candles, indicators = _context_input()
+        llm = MagicMock()
+        llm.with_structured_output.side_effect = NotImplementedError("unsupported")
+        llm.invoke.return_value = SimpleNamespace(
+            content=json.dumps(_long_payload()),
+            response_metadata={"token_usage": {"prompt_tokens": 1500, "completion_tokens": 180, "total_tokens": 1680}},
+        )
+        result = SignalAnalyzer(CONFIG, llm=llm).analyze(candles, indicators)
+        self.assertEqual(result.llm_calls, 1)
+        self.assertEqual(result.prompt_tokens, 1500)
+        self.assertEqual(result.completion_tokens, 180)
+        self.assertEqual(result.total_tokens, 1680)
+
+    def test_quota_tokens_null_without_metadata(self):
+        candles, indicators = _context_input()
+        llm, structured = _structured_llm(SignalDecisionModel(**_long_payload()))
+        result = SignalAnalyzer(CONFIG, llm=llm).analyze(candles, indicators)
+        self.assertEqual(result.llm_calls, 1)
+        self.assertIsNone(result.prompt_tokens)
+        self.assertIsNone(result.completion_tokens)
+        self.assertIsNone(result.total_tokens)
+
+    def test_extract_usage_variants(self):
+        self.assertEqual(
+            _extract_usage(SimpleNamespace(response_metadata={"token_usage": {"prompt_tokens": 10, "completion_tokens": 5}})),
+            {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        )
+        self.assertEqual(
+            _extract_usage(SimpleNamespace(usage_metadata={"input_tokens": 7, "output_tokens": 3, "total_tokens": 10})),
+            {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+        )
+        self.assertIsNone(_extract_usage(SimpleNamespace(content="{}")))
+        self.assertIsNone(_extract_usage(SimpleNamespace(response_metadata={"token_usage": {"prompt_tokens": -1}})))
+        self.assertIsNone(_extract_usage(object()))
 
     def test_fallback_plain_string_response(self):
         candles, indicators = _context_input()

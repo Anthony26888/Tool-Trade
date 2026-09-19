@@ -26,11 +26,14 @@ untouched.
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from typing import Any
 
 from tradingagents.llm_clients import BaseLLMClient, create_llm_client
+
+logger = logging.getLogger(__name__)
 
 # Environment variable names for the signal pipeline's LLM configuration.
 # Selecting a model or provider is purely configuration-driven; application
@@ -45,6 +48,14 @@ ENV_LLM_MAX_TOKENS = "BTCUSDT_LLM_MAX_TOKENS"
 
 DEFAULT_PROVIDER = "deepseek"
 DEFAULT_MODEL = "deepseek-v4-flash"
+
+#: Pinned request defaults (Phase E). Leaving them ``None`` used to inherit
+#: unverified SDK-version defaults and diverge between the env path (unset)
+#: and the Settings page (timeout 120s): resolve explicitly instead.
+DEFAULT_TIMEOUT_SECONDS = 120.0
+DEFAULT_MAX_RETRIES = 2
+TEMPERATURE_MIN = 0.0
+TEMPERATURE_MAX = 5.0
 
 # Default model per provider when only ``BTCUSDT_LLM_PROVIDER`` is set.
 PROVIDER_DEFAULT_MODEL: dict[str, str] = {
@@ -193,14 +204,48 @@ def llm_config_from_env(env: dict[str, Any] | None = None) -> LLMConfig:
     provider, model = _resolve_provider_model(env)
 
     base_url = (env.get(ENV_LLM_BASE_URL) or "").strip() or None
+    timeout = _env_float(ENV_LLM_TIMEOUT, env.get(ENV_LLM_TIMEOUT))
+    if timeout is None:
+        timeout = DEFAULT_TIMEOUT_SECONDS
+    elif timeout <= 0:
+        raise LLMConfigError(
+            f"Invalid value for {ENV_LLM_TIMEOUT}: expected positive seconds."
+        )
+    max_retries = _env_int(ENV_LLM_MAX_RETRIES, env.get(ENV_LLM_MAX_RETRIES))
+    if max_retries is None:
+        max_retries = DEFAULT_MAX_RETRIES
+    elif max_retries < 0:
+        raise LLMConfigError(
+            f"Invalid value for {ENV_LLM_MAX_RETRIES}: expected 0 or more."
+        )
+    temperature = _env_float(ENV_LLM_TEMPERATURE, env.get(ENV_LLM_TEMPERATURE))
+    if temperature is not None and not (
+        TEMPERATURE_MIN <= temperature <= TEMPERATURE_MAX
+    ):
+        raise LLMConfigError(
+            f"Invalid value for {ENV_LLM_TEMPERATURE}: expected "
+            f"{TEMPERATURE_MIN}-{TEMPERATURE_MAX}."
+        )
+    max_tokens = _env_int(ENV_LLM_MAX_TOKENS, env.get(ENV_LLM_MAX_TOKENS))
+    logger.info(
+        "[LLM] resolved %s/%s (timeout=%.0fs, max_retries=%d, temperature=%s, "
+        "max_tokens=%s, base_url=%s)",
+        provider,
+        model,
+        timeout,
+        max_retries,
+        temperature,
+        max_tokens,
+        base_url,
+    )
     return LLMConfig(
         provider=provider,
         model=model,
         base_url=base_url,
-        timeout=_env_float(ENV_LLM_TIMEOUT, env.get(ENV_LLM_TIMEOUT)),
-        max_retries=_env_int(ENV_LLM_MAX_RETRIES, env.get(ENV_LLM_MAX_RETRIES)),
-        temperature=_env_float(ENV_LLM_TEMPERATURE, env.get(ENV_LLM_TEMPERATURE)),
-        max_tokens=_env_int(ENV_LLM_MAX_TOKENS, env.get(ENV_LLM_MAX_TOKENS)),
+        timeout=timeout,
+        max_retries=max_retries,
+        temperature=temperature,
+        max_tokens=max_tokens,
     )
 
 

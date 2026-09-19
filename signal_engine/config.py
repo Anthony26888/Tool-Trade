@@ -570,15 +570,33 @@ class ConfigService:
         env_enabled = str(self.env.get("BTCUSDT_TELEGRAM_ENABLED", "")).lower() in ("1", "true", "yes")
         env_token = self.env.get("BTCUSDT_TELEGRAM_BOT_TOKEN", "") or ""
         env_chat = self.env.get("BTCUSDT_TELEGRAM_CHAT_ID", "") or ""
+        env_signals = self.env.get("BTCUSDT_TELEGRAM_CHAT_ID_SIGNALS", "") or ""
+        env_reports = self.env.get("BTCUSDT_TELEGRAM_CHAT_ID_REPORTS", "") or ""
         enabled = bool(stored.get("enabled", env_enabled)) if stored is not None else env_enabled
-        chat_id = (stored.get("chat_id", "") if stored is not None else env_chat) or env_chat
+        stored_legacy = (stored.get("chat_id", "") if stored is not None else "") or ""
+        signals = (
+            ((stored.get("chat_id_signals", "") if stored is not None else "") or "")
+            or stored_legacy
+            or env_signals
+            or env_chat
+        )
+        reports = (
+            ((stored.get("chat_id_reports", "") if stored is not None else "") or "")
+            or stored_legacy
+            or env_reports
+            or env_chat
+        )
         token_configured = bool(
             self._secrets.configured(SECRET_BOT_TOKEN) or env_token or (stored or {}).get("token_configured", False)
         )
         return {
             "enabled": enabled,
-            "chat_id_configured": bool(chat_id),
-            "chat_id_masked": "********" if chat_id else "",
+            "chat_id_configured": bool(signals),
+            "chat_id_masked": "********" if signals else "",
+            "chat_id_signals_configured": bool(signals),
+            "chat_id_signals_masked": "********" if signals else "",
+            "chat_id_reports_configured": bool(reports),
+            "chat_id_reports_masked": "********" if reports else "",
             "token_configured": token_configured,
             "token_masked": mask_secret(self._secrets.get(SECRET_BOT_TOKEN) or env_token),
             "updated_at": (stored or {}).get("updated_at"),
@@ -872,19 +890,23 @@ class ConfigService:
     def update_telegram(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Validate and persist the Telegram notification settings (no token echoes)."""
         enabled = bool(payload.get("enabled", False))
-        chat_id = _optional_str(payload, "chat_id")
+        legacy = _optional_str(payload, "chat_id")
+        signals = _optional_str(payload, "chat_id_signals") or legacy
+        reports = _optional_str(payload, "chat_id_reports") or legacy
         token = payload.get("bot_token")
         if isinstance(token, str) and token.strip() and "*" not in token:
             self._secrets.set(SECRET_BOT_TOKEN, token.strip())
         existing_token = self._secrets.get(SECRET_BOT_TOKEN) or self.env.get("BTCUSDT_TELEGRAM_BOT_TOKEN", "")
-        if enabled and (not chat_id or not existing_token):
+        if enabled and (not (signals or reports) or not existing_token):
             raise SettingsValidationError(
-                "Enabling Telegram requires a bot token and a chat id."
+                "Enabling Telegram requires a bot token and at least one chat id (signals or reports)."
             )
         token_configured = bool(existing_token)
         record = {
             "enabled": enabled,
-            "chat_id": chat_id,
+            "chat_id": legacy,
+            "chat_id_signals": signals,
+            "chat_id_reports": reports,
             "token_configured": token_configured,
             "updated_at": iso_utc_now(),
         }
@@ -1010,10 +1032,30 @@ class ConfigService:
     def _latency_ms(started: float) -> int:
         return max(0, int(round((time.monotonic() - started) * 1000)))
 
-    def test_telegram(self) -> dict[str, Any]:
-        """Send a test Telegram message to the configured chat (never echoes secrets)."""
+    def test_telegram(self, channel: str = "reports") -> dict[str, Any]:
+        """Send a test Telegram message to one channel (never echoes secrets).
+
+        ``channel`` is ``"signals"`` or ``"reports"`` (default); anything else
+        resolves like the router (missing channel falls back to the other).
+        """
         stored = self._stored_json(KEY_TELEGRAM) or {}
-        chat_id = stored.get("chat_id", "") or self.env.get("BTCUSDT_TELEGRAM_CHAT_ID", "") or ""
+        legacy = stored.get("chat_id", "") or self.env.get("BTCUSDT_TELEGRAM_CHAT_ID", "") or ""
+        if channel == "signals":
+            chat_id = (
+                stored.get("chat_id_signals", "")
+                or legacy
+                or self.env.get("BTCUSDT_TELEGRAM_CHAT_ID_SIGNALS", "")
+                or self.env.get("BTCUSDT_TELEGRAM_CHAT_ID", "")
+                or ""
+            )
+        else:
+            chat_id = (
+                stored.get("chat_id_reports", "")
+                or legacy
+                or self.env.get("BTCUSDT_TELEGRAM_CHAT_ID_REPORTS", "")
+                or self.env.get("BTCUSDT_TELEGRAM_CHAT_ID", "")
+                or ""
+            )
         token = self._secrets.get(SECRET_BOT_TOKEN) or self.env.get("BTCUSDT_TELEGRAM_BOT_TOKEN", "") or ""
         if not token or not chat_id:
             return {"success": False, "message_id": None, "error": "Telegram bot token and chat id are required."}
@@ -1033,8 +1075,10 @@ class ConfigService:
 
         The bot token always comes from the 0600 secrets file (falling back to
         the environment) and is never logged or echoed. ``timeout`` /
-        ``max_retries`` / ``backoff`` keep their environment defaults. Callers
-        must treat the returned config as read-only.
+        ``max_retries`` / ``backoff`` keep their environment defaults. Each
+        channel resolves new key > legacy key, env or stored; the legacy
+        single chat fills both. Callers must treat the returned config as
+        read-only.
         """
         from .telegram import TelegramConfig, telegram_config_from_env
 
@@ -1045,14 +1089,31 @@ class ConfigService:
         stored = self._stored_json(KEY_TELEGRAM)
         if stored is not None:
             enabled = bool(stored.get("enabled"))
-            chat_id = str(stored.get("chat_id") or "")
+            stored_legacy = str(stored.get("chat_id") or "")
+            signals = (
+                str(stored.get("chat_id_signals") or "")
+                or stored_legacy
+                or base.chat_id_signals
+                or base.chat_id
+            )
+            reports = (
+                str(stored.get("chat_id_reports") or "")
+                or stored_legacy
+                or base.chat_id_reports
+                or base.chat_id
+            )
+            legacy_out = stored_legacy or base.chat_id
         else:
             enabled = base.enabled
-            chat_id = base.chat_id
+            signals = base.chat_id_signals or base.chat_id
+            reports = base.chat_id_reports or base.chat_id
+            legacy_out = base.chat_id
         token = self._secrets.get(SECRET_BOT_TOKEN) or base.bot_token
         return TelegramConfig(
             bot_token=token,
-            chat_id=chat_id,
+            chat_id=legacy_out,
+            chat_id_signals=signals,
+            chat_id_reports=reports,
             enabled=enabled,
             timeout=base.timeout,
             max_retries=base.max_retries,

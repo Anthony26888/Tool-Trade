@@ -21,7 +21,13 @@ from types import SimpleNamespace
 
 from binance.client import BinanceConnectionError
 from binance.market_data import Candle
-from database.database import Database, DemoRepository, RuntimeStateRepository, SignalRepository
+from database.database import (
+    CandleLogRepository,
+    Database,
+    DemoRepository,
+    RuntimeStateRepository,
+    SignalRepository,
+)
 from database.models import STATUS_OPEN, STATUS_TP_HIT
 from demo.executor import DemoExecutor
 from signal_engine.config import ConfigService
@@ -122,7 +128,7 @@ class WebApiTestCase(unittest.TestCase):
         self.assertIn(".sidebar", raw)
 
     def test_brand_logo_served_as_png(self):
-        resp = urllib.request.urlopen(self.base + "/static/logo.png", timeout=10)
+        resp = urllib.request.urlopen(self.base + "/static/ai.png", timeout=10)
         try:
             self.assertEqual(resp.status, 200)
             self.assertEqual(resp.headers.get_content_type(), "image/png")
@@ -135,7 +141,8 @@ class WebApiTestCase(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("NEXTRA AI", raw)
         self.assertIn('rel="icon"', raw)
-        self.assertIn("/static/logo.png", raw)
+        self.assertIn('class="brand-logo"', raw)
+        self.assertIn("/static/ai.png", raw)
 
         status, raw = _request(self.base + "/nope", method="GET")
         self.assertEqual(status, 404)
@@ -528,6 +535,104 @@ class WebApiTestCase(unittest.TestCase):
         self.assertIsNone(data["position_outcomes"])
         self.assertEqual(status, 200)
 
+    def test_daemon_log_endpoint_list(self):
+        signal_id = SignalRepository(self.db).create_signal(
+            "BTCUSDT", "1h", "LONG", Decimal("61000"), Decimal("60000"), Decimal("64000")
+        ).id
+        CandleLogRepository(self.db).upsert(
+            symbol="BTCUSDT", timeframe="1h", candle_timestamp_ms=1_720_000_000_000,
+            outcome="CREATED", decision="LONG", confidence=82,
+            entry="61000", stop_loss="60000", take_profit="64000",
+            signal_id=signal_id, provider="deepseek", model="deepseek-v4-flash",
+            reasoning="uptrend", indicators_json='{"rsi14": 55.5}',
+        )
+        CandleLogRepository(self.db).upsert(
+            symbol="BTCUSDT", timeframe="1h", candle_timestamp_ms=1_720_003_600_000,
+            outcome="WAIT", decision="WAIT", confidence=60, reasoning="nothing",
+        )
+        _, data = self.get_json("/api/daemon-log")
+        self.assertEqual(data["count"], 2)
+        rows = {r["id"]: r for r in data["rows"]}
+        newest = data["rows"][0]
+        self.assertEqual(newest["decision"], "WAIT")
+        self.assertEqual(newest["outcome"], "WAIT")
+        created = data["rows"][1]
+        self.assertEqual(created["decision"], "LONG")
+        self.assertEqual(created["signal_id"], signal_id)
+        self.assertEqual(created["entry"], "61000")
+        self.assertEqual(created["indicators"]["rsi14"], 55.5)
+        self.assertEqual(created["model"], "deepseek-v4-flash")
+        self.assertIn(signal_id, rows)
+
+    def test_daemon_log_filters_by_decision(self):
+        repo = CandleLogRepository(self.db)
+        repo.upsert(
+            symbol="BTCUSDT", timeframe="1h", candle_timestamp_ms=1_720_000_000_000,
+            outcome="CREATED", decision="LONG", confidence=82,
+        )
+        repo.upsert(
+            symbol="BTCUSDT", timeframe="1h", candle_timestamp_ms=1_720_003_600_000,
+            outcome="WAIT", decision="WAIT", confidence=60,
+        )
+        _, data = self.get_json("/api/daemon-log?decision=LONG&limit=10")
+        self.assertEqual(data["count"], 1)
+        self.assertEqual(data["rows"][0]["decision"], "LONG")
+
+    def test_daemon_log_empty(self):
+        _, data = self.get_json("/api/daemon-log")
+        self.assertEqual(data["count"], 0)
+        self.assertEqual(data["rows"], [])
+
+    def test_clear_daemon_log_endpoint(self):
+        repo = CandleLogRepository(self.db)
+        repo.upsert(
+            symbol="BTCUSDT", timeframe="1h", candle_timestamp_ms=1_720_000_000_000,
+            outcome="WAIT", decision="WAIT",
+        )
+        status, raw = _request(self.base + "/api/daemon-log", method="DELETE")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw)["cleared"], 1)
+        _, data = self.get_json("/api/daemon-log")
+        self.assertEqual(data["count"], 0)
+
+    def test_daemon_log_invalid_decision_returns_400(self):
+        status, raw = _request(self.base + "/api/daemon-log?decision=ROCKET")
+        self.assertEqual(status, 400)
+
+    def test_daemon_log_indicator_json_is_parsed(self):
+        repo = CandleLogRepository(self.db)
+        repo.upsert(
+            symbol="BTCUSDT", timeframe="1h", candle_timestamp_ms=1_720_000_000_000,
+            outcome="CREATED", decision="SHORT", confidence=70,
+            indicators_json='{"ema20": 60000, "volume_ratio": 1.4}',
+        )
+        _, data = self.get_json("/api/daemon-log")
+        indicators = data["rows"][0]["indicators"]
+        self.assertEqual(indicators["ema20"], 60000)
+        self.assertEqual(indicators["volume_ratio"], 1.4)
+
+    def test_daemon_log_includes_quota_fields(self):
+        repo = CandleLogRepository(self.db)
+        repo.upsert(
+            symbol="BTCUSDT", timeframe="1h", candle_timestamp_ms=1_720_000_000_000,
+            outcome="CREATED", decision="LONG", llm_calls=5,
+            prompt_tokens=10500, completion_tokens=1800, total_tokens=12300,
+        )
+        repo.upsert(
+            symbol="BTCUSDT", timeframe="1h", candle_timestamp_ms=1_720_003_600_000,
+            outcome="WAIT", decision="WAIT",
+        )
+        _, data = self.get_json("/api/daemon-log")
+        by_ts = {r["candle_timestamp_ms"]: r for r in data["rows"]}
+        created = by_ts[1_720_000_000_000]
+        self.assertEqual(created["llm_calls"], 5)
+        self.assertEqual(created["prompt_tokens"], 10500)
+        self.assertEqual(created["completion_tokens"], 1800)
+        self.assertEqual(created["total_tokens"], 12300)
+        wait = by_ts[1_720_003_600_000]
+        self.assertIsNone(wait["llm_calls"])
+        self.assertIsNone(wait["total_tokens"])
+
 
 def _sample_candles(count: int = 30) -> list[Candle]:
     start = 1_700_000_000_000
@@ -862,6 +967,63 @@ class ChartApiTestCase(unittest.TestCase):
             "clearErrorBtn",
             '"/api/runtime/clear-error"',
             "Clear the stored",
+        ):
+            self.assertIn(marker, raw)
+
+    def test_static_contains_mobile_responsive_ui(self):
+        status, raw = _request(self.base + "/")
+        self.assertEqual(status, 200)
+        for marker in (
+            'class="bottom-nav"',
+            'data-panel="dashboard"',
+            'class="nav-item nav-center"',
+            'id="settingsGear"',
+            'name="theme-color"',
+        ):
+            self.assertIn(marker, raw)
+        status, raw = _request(self.base + "/static/style.css")
+        self.assertEqual(status, 200)
+        for marker in (
+            "max-width: 900px",
+            "max-width: 720px",
+            ".nav-center",
+            "attr(data-label)",
+            "safe-area-inset-bottom",
+        ):
+            self.assertIn(marker, raw)
+        self.assertGreaterEqual(
+            raw.count("padding-bottom: calc(100px + env(safe-area-inset-bottom))"),
+            2,
+            "bottom padding clearance must survive the 720px override",
+        )
+        status, raw = _request(self.base + "/static/app.js")
+        self.assertEqual(status, 200)
+        for marker in ("data-label=", "settingsGear", 'showPanel("settings")'):
+            self.assertIn(marker, raw)
+
+    def test_static_contains_loading_overlay(self):
+        status, raw = _request(self.base + "/")
+        self.assertEqual(status, 200)
+        for marker in ('id="loading"', 'class="loading hidden"', "loading-logo", "/static/ai.png"):
+            self.assertIn(marker, raw)
+        status, raw = _request(self.base + "/static/style.css")
+        self.assertEqual(status, 200)
+        for marker in (".loading {", ".loading-ring", ".loading-ring::before", ".loading-logo", "112px", "@keyframes load-spin"):
+            self.assertIn(marker, raw)
+        status, raw = _request(self.base + "/static/app.js")
+        self.assertEqual(status, 200)
+        for marker in ("showLoader", "hideLoader", "Promise.allSettled(jobs)", "loadSeq"):
+            self.assertIn(marker, raw)
+
+    def test_static_daemon_table_shows_quota(self):
+        status, raw = _request(self.base + "/static/app.js")
+        self.assertEqual(status, 200)
+        for marker in (
+            "<th>Calls</th>",
+            'data-label="Calls"',
+            'colspan="10"',
+            "tokens in / out / total",
+            "LLM calls",
         ):
             self.assertIn(marker, raw)
 

@@ -15,7 +15,12 @@ import pytest
 
 from backtest.__main__ import main
 from backtest.benchmark import DecisionCache, LLMDecisionProvider, compute_scope
-from backtest.benchmark.models import DecisionStatus, ModelDecision, RunningInferenceStats
+from backtest.benchmark.models import (
+    CONTEXT_VERSION,
+    DecisionStatus,
+    ModelDecision,
+    RunningInferenceStats,
+)
 from backtest.benchmark.runner import run_benchmark
 from backtest.config import BacktestConfig
 from backtest.data import HistoricalData, save_historical_data_json
@@ -124,7 +129,7 @@ def test_cross_model_cache_isolation(tmp_path):
         symbol="BTCUSDT",
         timeframe="1h",
         max_candles=40,
-        context_version=1,
+        context_version=CONTEXT_VERSION,
         dataset_id=None,
     )
     scope_gemma = compute_scope(
@@ -138,7 +143,7 @@ def test_cross_model_cache_isolation(tmp_path):
         symbol="BTCUSDT",
         timeframe="1h",
         max_candles=40,
-        context_version=1,
+        context_version=CONTEXT_VERSION,
         dataset_id=None,
     )
     assert scope_qwen != scope_gemma
@@ -254,7 +259,7 @@ def test_cache_replay_no_llm_calls(tmp_path):
     assert cache.get(compute_scope(
         provider="ollama", model="qwen3:4b", base_url=None, temperature=0.0,
         timeout=None, max_retries=None, max_tokens=None, symbol="BTCUSDT",
-        timeframe="1h", max_candles=40, context_version=1, dataset_id=None,
+        timeframe="1h", max_candles=40, context_version=CONTEXT_VERSION, dataset_id=None,
     ), int(hours[200].timestamp)) is not None
 
     calls = [0]
@@ -273,19 +278,19 @@ def test_cache_scope_differs_by_config():
         provider=base.provider, model=base.model, base_url=base.base_url,
         temperature=0.0, timeout=base.timeout, max_retries=base.max_retries,
         max_tokens=base.max_tokens, symbol="BTCUSDT", timeframe="1h",
-        max_candles=40, context_version=1, dataset_id=None,
+        max_candles=40, context_version=CONTEXT_VERSION, dataset_id=None,
     )
     scope_b = compute_scope(
         provider=base.provider, model=base.model, base_url=base.base_url,
         temperature=0.0, timeout=base.timeout, max_retries=base.max_retries,
         max_tokens=base.max_tokens, symbol="BTCUSDT", timeframe="1h",
-        max_candles=80, context_version=1, dataset_id=None,
+        max_candles=80, context_version=CONTEXT_VERSION, dataset_id=None,
     )
     scope_c = compute_scope(
         provider=base.provider, model=base.model, base_url=base.base_url,
         temperature=0.5, timeout=base.timeout, max_retries=base.max_retries,
         max_tokens=base.max_tokens, symbol="BTCUSDT", timeframe="1h",
-        max_candles=40, context_version=1, dataset_id=None,
+        max_candles=40, context_version=CONTEXT_VERSION, dataset_id=None,
     )
     assert scope_a != scope_b
     assert scope_a != scope_c
@@ -293,11 +298,13 @@ def test_cache_scope_differs_by_config():
         provider=base.provider, model=base.model, base_url=base.base_url,
         temperature=0.0, timeout=base.timeout, max_retries=base.max_retries,
         max_tokens=base.max_tokens, symbol="BTCUSDT", timeframe="1h",
-        max_candles=40, context_version=1, dataset_id=None,
+        max_candles=40, context_version=CONTEXT_VERSION, dataset_id=None,
     )
 
 
-def test_force_fresh_truncates_and_recalls(tmp_path):
+def test_force_fresh_truncates_and_recalls(tmp_path, monkeypatch):
+    from backtest.benchmark import runner as runner_module
+
     hours = make_hours(220)
     data = HistoricalData(
         symbol="BTCUSDT",
@@ -307,6 +314,11 @@ def test_force_fresh_truncates_and_recalls(tmp_path):
         minute_candles=tuple(covering_minutes(hours)),
     )
     out = str(tmp_path / "out")
+    # Scripted WAIT analyzer: first run caches OK rows (no real LLM), so the
+    # replay path below exercises cache hits instead of live failures.
+    monkeypatch.setattr(
+        runner_module, "build_llm_decision_provider", _fake_factory({})
+    )
 
     first = run_benchmark(
         config=_config(), data=data, out_dir=out,
@@ -361,12 +373,11 @@ def test_model_failure_recovered_as_rejected_event_not_wait(tmp_path):
     )
     result = BacktestEngine(_config(), data, provider).run()
 
+    # FAILED rows are never cached (a later run must retry the live call
+    # instead of replaying the failure), but the engine still records an
+    # explicit rejected event for the fallback LONG.
     failed = [r for r in provider.cache.records() if r.status == DecisionStatus.FAILED]
-    assert len(failed) == 1
-    assert failed[0].candle_ts == failing_ts
-    assert failed[0].decision == "LONG"  # the invalid fallback, never WAIT
-    assert failed[0].entry_price == failed[0].stop_loss
-    assert failed[0].error is not None
+    assert failed == []
 
     assert result.analyzed == result.eligible              # run never aborted
     assert result.rejected_count == 1                      # explicit rejected event
@@ -374,6 +385,52 @@ def test_model_failure_recovered_as_rejected_event_not_wait(tmp_path):
     # The failed candle was NOT counted as the model choosing WAIT.
     assert all(r.status == DecisionStatus.OK and r.decision == "WAIT"
                for r in provider.cache.records() if r.candle_ts != failing_ts)
+
+
+def test_cached_failed_is_retried_not_replayed(tmp_path):
+    # A FAILED row left by an earlier interrupted run (e.g. rate limit) must
+    # trigger a fresh live call on resume, never a replay of the fallback.
+    from tests.signal_engine_test_helpers import indicators_for, make_candles
+
+    candles = make_candles(220)
+    indicators = indicators_for(candles)
+    last = candles[-1]
+    cache = DecisionCache(str(tmp_path / "decisions.jsonl"))
+    calls = [0]
+    observed: list = []
+    provider = LLMDecisionProvider(
+        model="qwen3:4b",
+        provider="ollama",
+        cache=cache,
+        config=_llm("qwen3:4b"),
+        analyze_fn=_recording_fn({}, observed, calls),
+    )
+    cache.put(
+        ModelDecision(
+            model="qwen3:4b",
+            provider="ollama",
+            candle_ts=int(last.timestamp),
+            candle_close=float(last.close),
+            status=DecisionStatus.FAILED,
+            decision="LONG",
+            confidence=0.0,
+            reasoning="boom",
+            entry_price=float(last.close),
+            stop_loss=float(last.close),
+            take_profit=float(last.close),
+            latency_sec=1.0,
+            cached=False,
+            scope=provider._scope("BTCUSDT", "1h", 20),
+            context_version=CONTEXT_VERSION,
+            analysis_timestamp="2026-01-01T00:00:00Z",
+            error="boom",
+        )
+    )
+    analysis = provider.decide(
+        list(candles), indicators, symbol="BTCUSDT", timeframe="1h", max_candles=20
+    )
+    assert calls[0] == 1
+    assert analysis.decision == "WAIT"
 
 
 def test_invalid_output_rejected_never_becomes_trade(tmp_path):
@@ -421,11 +478,11 @@ def test_signal_quality_tallies(tmp_path, monkeypatch):
         ts[199]: long_decision(float(hours[199].close)),
         ts[200]: {
             "decision": "SHORT",
-            "confidence": 55.0,
+            "confidence": 65.0,
             "reasoning": "r",
             "entry_price": float(hours[200].close) + 5,
             "stop_loss": float(hours[200].close) + 40,
-            "take_profit": float(hours[200].close) - 40,
+            "take_profit": float(hours[200].close) - 50,
         },
         ts[201]: {"decision": "WAIT", "confidence": 20.0, "reasoning": "r"},
     }
@@ -452,8 +509,8 @@ def test_signal_quality_tallies(tmp_path, monkeypatch):
     assert quality["wait"] == 19
     assert quality["signal_count"] == 2
     assert quality["failed"] == 0 and quality["invalid"] == 0
-    # confidence average across the two directional signals: (90 + 55) / 2 = 72.5
-    assert quality["avg_confidence"] == 72.5
+    # confidence average across the two directional signals: (90 + 65) / 2 = 77.5
+    assert quality["avg_confidence"] == 77.5
     assert quality["confidence_buckets"] == {"0-39": 0, "40-69": 1, "70-89": 0, "90-100": 1}
     assert quality["long_short_ratio"] == 1.0
     assert quality["signal_frequency"] == round(2 / 21, 6)  # 2 signals / 21 eligible
@@ -497,7 +554,7 @@ def test_compare_summaries_table(tmp_path, monkeypatch):
         for i in long_ts
     }
 
-    def fake_factory(*, llm_config, cache, context_version=1, dataset_id=None, force_fresh=False):
+    def fake_factory(*, llm_config, cache, context_version=CONTEXT_VERSION, dataset_id=None, force_fresh=False):
         from backtest.benchmark.provider import LLMDecisionProvider
         return LLMDecisionProvider(
             model=llm_config.model,
@@ -612,7 +669,7 @@ def _save_data(tmp_path, hours):
 
 
 def _fake_factory(decisions):
-    def factory(*, llm_config, cache, context_version=1, dataset_id=None, force_fresh=False):
+    def factory(*, llm_config, cache, context_version=CONTEXT_VERSION, dataset_id=None, force_fresh=False):
         from backtest.benchmark.provider import LLMDecisionProvider
         return LLMDecisionProvider(
             model=llm_config.model,
@@ -734,7 +791,7 @@ def test_decision_record_round_trip(tmp_path):
         latency_sec=1.25,
         cached=False,
         scope="scope",
-        context_version=1,
+        context_version=CONTEXT_VERSION,
         analysis_timestamp="2026-01-01T00:00:00Z",
     )
     cache.put(record)

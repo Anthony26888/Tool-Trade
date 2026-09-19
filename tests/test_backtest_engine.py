@@ -236,6 +236,7 @@ def test_entry_monitoring_never_uses_signal_candle_minutes():
                 high, low = base + 2.0, base - 2.0
             minutes.append(minute(ts, base, high, low, base))
     # Entry is placed ABOVE the reachable post-decision high so it can never fill.
+    # TP keeps RR >= 1.2 (Phase B guardrail): TP distance 100 / SL distance 80.
     entry = float(hours[199].close) + 30
     decision = {
         "decision": "LONG",
@@ -243,7 +244,7 @@ def test_entry_monitoring_never_uses_signal_candle_minutes():
         "reasoning": "gate",
         "entry_price": entry,
         "stop_loss": float(hours[199].close) - 50,
-        "take_profit": float(hours[199].close) + 60,
+        "take_profit": float(hours[199].close) + 130,
     }
     data = dataset(hours, minutes)
     result = BacktestEngine(

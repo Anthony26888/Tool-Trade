@@ -50,7 +50,18 @@ class DemoExecutorTestCase(unittest.TestCase):
         self.executor = DemoExecutor(self.harness.db, config=demo_config())
 
     def _create_signal(self, decision="LONG", **overrides):
-        result = self.harness.engine.process(make_analysis(decision, **overrides))
+        from signal_engine import GuardrailConfig
+
+        # Guardrails relaxed on purpose: demo tests verify PnL math on
+        # symmetric levels, not validator policy.
+        relaxed = GuardrailConfig(
+            min_confidence=0,
+            min_risk_reward=Decimal("0"),
+            fee_rate=Decimal("0"),
+        )
+        result = self.harness.engine.process(
+            make_analysis(decision, **overrides), guardrails=relaxed
+        )
         self.assertEqual(result.outcome.value, "CREATED")
         return result.signal
 
@@ -163,6 +174,44 @@ class TestPositionOpen(DemoExecutorTestCase):
         second = self.executor.open_position(signal)
         self.assertEqual(first.id, second.id)
         self.assertEqual(len(self.repo.list_positions(status="OPEN")), 1)
+
+    def test_open_applies_risk_cap_on_wide_stop(self):
+        # SL 5000 away: risk qty 10/5000 = 0.002 beats margin qty 500/61000.
+        signal = self._open(
+            self._create_signal(
+                "LONG",
+                entry_price=61000.0,
+                stop_loss=56000.0,
+                take_profit=67000.0,
+            )
+        )
+        position = self.executor.open_position(signal)
+        self.assertIsNotNone(position)
+        self.assertEqual(position.quantity, Decimal("0.002"))
+        self.assertEqual(position.position_size, Decimal("0.002") * Decimal("61000.0"))
+
+    def test_open_refused_when_balance_below_margin(self):
+        account = self.executor.ensure_account()
+        self.repo.update_balance(account.id, balance="10", equity="10", peak_equity="10")
+        signal = self._open(self._create_signal("LONG"))
+        self.assertIsNone(self.executor.open_position(signal))
+        self.assertEqual(self.repo.list_positions(), [])
+
+    def test_open_applies_slippage_when_configured(self):
+        from demo.executor import DemoExecutor
+
+        executor = DemoExecutor(
+            self.harness.db, config=demo_config(slippage_bps=Decimal("2"))
+        )
+        signal = self._open(self._create_signal("LONG"))
+        position = executor.open_position(signal)
+        self.assertIsNotNone(position)
+        # LONG pays up 2 bps on entry: 61000 * 1.0002.
+        self.assertEqual(position.entry_price, Decimal("61012.2"))
+        self.assertEqual(
+            position.quantity,
+            Decimal("500") / Decimal("61012.2"),
+        )
 
 
 # ── Position close / trade recording ─────────────────────────────────────────

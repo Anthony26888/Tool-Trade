@@ -294,6 +294,14 @@ class TestVolume(unittest.TestCase):
         self.assertEqual(_first_valid(df["volume_sma20"]), 19)
         self.assertEqual(_first_valid(df["volume_ratio"]), 19)
 
+    def test_zero_volume_window_yields_nan_not_inf(self):
+        # 20 zero-volume bars then a print: sma is 0, so the raw ratio is
+        # inf — normalized to NaN so snapshot validation treats it as a gap.
+        volumes = [0.0] * 20 + [400.0]
+        df = compute_indicator_matrix(_make_candles([100.0] * 21, volumes))
+        self.assertTrue(math.isnan(df["volume_ratio"].iloc[19]))
+        self.assertFalse(math.isinf(df["volume_ratio"].iloc[19]))
+
 
 @pytest.mark.unit
 class TestNoLookAhead(unittest.TestCase):

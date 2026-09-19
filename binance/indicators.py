@@ -261,7 +261,11 @@ def compute_indicator_matrix(candles: list[Candle]) -> pd.DataFrame:
     df["bb_upper"] = bb_upper
     df["bb_lower"] = bb_lower
     df["volume_sma20"] = _rolling_sma(volume, _VOLUME_PERIOD)
-    df["volume_ratio"] = df["volume"] / df["volume_sma20"]
+    # A zero-volume window yields inf, never a signal: normalize to NaN so
+    # downstream snapshot validation treats it like any warm-up gap.
+    df["volume_ratio"] = (df["volume"] / df["volume_sma20"]).replace(
+        [np.inf, -np.inf], np.nan
+    )
     return df
 
 

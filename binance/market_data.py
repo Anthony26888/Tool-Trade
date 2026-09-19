@@ -26,6 +26,17 @@ logger = logging.getLogger(__name__)
 DEFAULT_SYMBOL = "BTCUSDT"
 SUPPORTED_INTERVALS = ("1m", "5m", "15m", "1h", "4h")
 
+#: Open-time spacing per supported interval, used only to detect missing
+#: candles (exchange outages) so a warning is logged instead of silently
+#: bridging indicators across the gap.
+INTERVAL_MS = {
+    "1m": 60_000,
+    "5m": 300_000,
+    "15m": 900_000,
+    "1h": 3_600_000,
+    "4h": 14_400_000,
+}
+
 KLINE_PATH = "/fapi/v1/klines"
 
 # Binance returns 12 columns per kline: open_time, open, high, low, close,
@@ -126,8 +137,8 @@ def _parse_kline(row: Any, now_ms: int) -> Candle:
     if timestamp < 0 or close_time < 0 or close_time < timestamp:
         raise MalformedKlineError(f"invalid timestamps in kline row: {row!r}")
     prices = (open_price, high, low, close)
-    if not all(math.isfinite(p) and p >= 0 for p in prices):
-        raise MalformedKlineError(f"non-finite or negative price in kline row: {row!r}")
+    if not all(math.isfinite(p) and p > 0 for p in prices):
+        raise MalformedKlineError(f"non-finite or non-positive price in kline row: {row!r}")
     if not (math.isfinite(volume) and volume >= 0):
         raise MalformedKlineError(f"non-finite or negative volume in kline row: {row!r}")
     if high < max(open_price, close):
@@ -145,6 +156,28 @@ def _parse_kline(row: Any, now_ms: int) -> Candle:
         close_time=close_time,
         is_closed=is_candle_closed(close_time, now_ms),
     )
+
+
+def _warn_on_gaps(candles: list[Candle], symbol: str, interval: str) -> None:
+    """Log a warning when fetched candles skip timestamps (exchange outage).
+
+    Never raises: indicators bridge NaN-free across the gap, so operators
+    must at least see it in the logs.
+    """
+    step = INTERVAL_MS.get(interval)
+    if step is None:
+        return
+    for prev, curr in zip(candles, candles[1:], strict=False):
+        if curr.timestamp - prev.timestamp != step:
+            missing = (curr.timestamp - prev.timestamp) // step - 1
+            logger.warning(
+                "[MarketData] %s %s gap: %d candle(s) missing between %s and %s",
+                symbol,
+                interval,
+                missing,
+                prev.timestamp,
+                curr.timestamp,
+            )
 
 
 def parse_klines(raw: Any, now_ms: int) -> list[Candle]:
@@ -224,6 +257,7 @@ class BinanceMarketData:
             raise EmptyKlineError(
                 f"no klines returned for {normalized_symbol} {normalized_interval}"
             )
+        _warn_on_gaps(candles, normalized_symbol, normalized_interval)
         return candles
 
     def fetch_closed_klines(

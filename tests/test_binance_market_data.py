@@ -175,6 +175,18 @@ class TestKlineParsing(unittest.TestCase):
         with self.assertRaises(MalformedKlineError):
             parse_klines([row], now_ms=0)
 
+    def test_rejects_zero_price(self):
+        # A zero close would poison EMA/RSI; zero volume stays legal.
+        row = _kline(1_600_000_000_000, close="0.0")
+        with self.assertRaises(MalformedKlineError):
+            parse_klines([row], now_ms=0)
+        zero_open = _kline(1_600_003_600_000, open_px="0.0")
+        with self.assertRaises(MalformedKlineError):
+            parse_klines([zero_open], now_ms=0)
+        zero_volume = _kline(1_600_007_200_000, volume="0.0")
+        candles = parse_klines([zero_volume], now_ms=0)
+        self.assertEqual(candles[0].volume, 0.0)
+
     def test_rejects_non_finite_price(self):
         row = _kline(1_600_000_000_000, open_px="nan")
         with self.assertRaises(MalformedKlineError):
@@ -229,6 +241,24 @@ class TestFetchKlines(unittest.TestCase):
         self.assertEqual(len(candles), 3)
         self.assertTrue(all(c.is_closed for c in candles))
         self.assertEqual(mocked.call_count, 1)
+
+    def test_fetch_klines_with_gap_logs_warning(self):
+        raw = [_kline(1_600_000_000_000), _kline(1_600_007_200_000)]
+        market = BinanceMarketData(client=BinanceFuturesClient(max_retries=0))
+        with _patch_get(_http(payload=raw)), self.assertLogs(
+            "binance.market_data", level="WARNING"
+        ) as logs:
+            candles = market.fetch_klines(now_ms=_SAMPLE_NOW_PAST_ALL)
+        self.assertEqual(len(candles), 2)
+        self.assertTrue(any("gap" in line for line in logs.output))
+
+    def test_fetch_klines_contiguous_is_silent(self):
+        raw = _sample_rows()
+        market = BinanceMarketData(client=BinanceFuturesClient(max_retries=0))
+        with _patch_get(_http(payload=raw)), self.assertNoLogs(
+            "binance.market_data", level="WARNING"
+        ):
+            market.fetch_klines(now_ms=_SAMPLE_NOW_PAST_ALL)
 
     def test_btcusdt_symbol_passed_to_request(self):
         market = BinanceMarketData(client=BinanceFuturesClient(max_retries=0))

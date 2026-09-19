@@ -26,7 +26,7 @@ def test_defaults_validate():
     assert config.slippage_bps == Decimal("0")
     assert config.funding_rates is None
     assert config.min_candles == 200
-    assert config.max_candles == 40
+    assert config.max_candles == 20
     validate_config(config)
 
 

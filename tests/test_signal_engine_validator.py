@@ -14,6 +14,7 @@ import pytest
 
 from database.models import SignalValidationError
 from signal_engine import (
+    GuardrailConfig,
     to_price,
     validate_analysis,
     validate_confidence,
@@ -120,7 +121,7 @@ class TestValidateAnalysis(unittest.TestCase):
 
     def test_valid_short_becomes_exact_candidate(self):
         candidate = validate_analysis(
-            make_analysis("SHORT", entry_price=59000.0, stop_loss=60000.0, take_profit=58000.0)
+            make_analysis("SHORT", entry_price=59000.0, stop_loss=60000.0, take_profit=57700.0)
         )
         self.assertEqual(candidate.decision, "SHORT")
         self.assertEqual(candidate.entry, Decimal("59000.0"))
@@ -173,10 +174,16 @@ class TestValidateAnalysis(unittest.TestCase):
         self.assertEqual(candidate.take_profit, Decimal("61234.9876543210987654321"))
 
     def test_near_equal_levels_use_decimal_ordering(self):
+        # Guardrails relaxed on purpose: this test proves Decimal ordering
+        # precision, not trade structure (dust distances fail fee/RR rules).
+        relaxed = GuardrailConfig(
+            min_confidence=0, min_risk_reward=Decimal("0"), fee_rate=Decimal("0")
+        )
         candidate = validate_analysis(
             make_analysis(
                 entry_price=OPEN, stop_loss=HALF_OPEN, take_profit=TP
-            )
+            ),
+            guardrails=relaxed,
         )
         self.assertEqual(candidate.entry, Decimal("100"))
         # Decimal comparison: 99.999... < 100 < 100.000...
@@ -202,3 +209,128 @@ class TestValidateAnalysis(unittest.TestCase):
     def test_candle_close_price_optional(self):
         candidate = validate_analysis(make_analysis(candle_close_price=None))
         self.assertIsNone(candidate.candle_close_price)
+
+
+@pytest.mark.unit
+class TestGuardrails(unittest.TestCase):
+    """Phase B trade-structure guardrails (policy, not contract)."""
+
+    def test_confidence_below_minimum_rejected(self):
+        with self.assertRaises(SignalValidationError) as ctx:
+            validate_analysis(make_analysis(confidence=59.0))
+        self.assertIn("below minimum 60", str(ctx.exception))
+
+    def test_confidence_at_minimum_accepted(self):
+        candidate = validate_analysis(make_analysis(confidence=60.0))
+        self.assertEqual(candidate.confidence, 60)
+
+    def test_min_confidence_from_env(self):
+        guards = GuardrailConfig.from_env({"BTCUSDT_MIN_CONFIDENCE": "70"})
+        self.assertEqual(guards.min_confidence, 70)
+        with self.assertRaises(SignalValidationError):
+            validate_analysis(make_analysis(confidence=69.0), guardrails=guards)
+        candidate = validate_analysis(make_analysis(confidence=70.0), guardrails=guards)
+        self.assertEqual(candidate.confidence, 70)
+
+    def test_min_confidence_zero_disables_the_check(self):
+        guards = GuardrailConfig.from_env({"BTCUSDT_MIN_CONFIDENCE": "0"})
+        candidate = validate_analysis(make_analysis(confidence=5.0), guardrails=guards)
+        self.assertEqual(candidate.confidence, 5)
+
+    def test_invalid_env_falls_back_to_default(self):
+        guards = GuardrailConfig.from_env({"BTCUSDT_MIN_CONFIDENCE": "high"})
+        self.assertEqual(guards.min_confidence, 60)
+        guards = GuardrailConfig.from_env({"BTCUSDT_MIN_RISK_REWARD": "nan"})
+        self.assertEqual(guards.min_risk_reward, Decimal("1.2"))
+
+    def test_low_risk_reward_rejected(self):
+        # LONG 61000/60000/61500: RR = 500/1000 = 0.5 < 1.2.
+        with self.assertRaises(SignalValidationError) as ctx:
+            validate_analysis(make_analysis(take_profit=61500.0))
+        self.assertIn("risk-reward", str(ctx.exception))
+
+    def test_risk_reward_disabled_at_zero(self):
+        guards = GuardrailConfig(
+            min_confidence=0,
+            min_risk_reward=Decimal("0"),
+            fee_rate=Decimal("0"),
+        )
+        candidate = validate_analysis(make_analysis(take_profit=61500.0), guardrails=guards)
+        self.assertEqual(candidate.take_profit, Decimal("61500.0"))
+
+    def test_take_profit_below_fee_cover_rejected(self):
+        # LONG 61000/60965/61042: RR = 42/35 = 1.2 but TP distance 42
+        # < 61000*0.0004*2 = 48.8 fee cover.
+        with self.assertRaises(SignalValidationError) as ctx:
+            validate_analysis(
+                make_analysis(stop_loss=60965.0, take_profit=61042.0)
+            )
+        self.assertIn("fees", str(ctx.exception))
+
+    def test_fee_check_disabled_at_zero(self):
+        guards = GuardrailConfig(
+            min_confidence=0,
+            min_risk_reward=Decimal("0"),
+            fee_rate=Decimal("0"),
+        )
+        candidate = validate_analysis(
+            make_analysis(stop_loss=60965.0, take_profit=61042.0), guardrails=guards
+        )
+        self.assertEqual(candidate.take_profit, Decimal("61042.0"))
+
+    def test_atr_bounds_accept_sane_distances(self):
+        import dataclasses
+
+        # ATR 500: SL 1000 = 2xATR, TP 3000 = 6xATR, entry 50.5 from close.
+        analysis = dataclasses.replace(make_analysis(), atr=500.0)
+        candidate = validate_analysis(analysis)
+        self.assertEqual(candidate.entry, Decimal("61000.0"))
+
+    def test_stop_too_tight_rejected(self):
+        import dataclasses
+
+        # SL distance 200 < 0.5*500 = 250.
+        analysis = dataclasses.replace(
+            make_analysis(stop_loss=60800.0), atr=500.0
+        )
+        with self.assertRaises(SignalValidationError) as ctx:
+            validate_analysis(analysis)
+        self.assertIn("stop-loss distance", str(ctx.exception))
+
+    def test_stop_too_wide_rejected(self):
+        import dataclasses
+
+        # SL distance 3000 > 5*500 = 2500 (TP keeps RR 5000/3000 valid).
+        analysis = dataclasses.replace(
+            make_analysis(stop_loss=58000.0, take_profit=66000.0), atr=500.0
+        )
+        with self.assertRaises(SignalValidationError) as ctx:
+            validate_analysis(analysis)
+        self.assertIn("stop-loss distance", str(ctx.exception))
+
+    def test_take_profit_too_far_rejected(self):
+        import dataclasses
+
+        # TP distance 5000 > 8*500 = 4000.
+        analysis = dataclasses.replace(
+            make_analysis(take_profit=66000.0), atr=500.0
+        )
+        with self.assertRaises(SignalValidationError) as ctx:
+            validate_analysis(analysis)
+        self.assertIn("take-profit distance", str(ctx.exception))
+
+    def test_stale_entry_rejected(self):
+        import dataclasses
+
+        # |61000 - 60000| = 1000 > 1.5*500 = 750.
+        analysis = dataclasses.replace(
+            make_analysis(candle_close_price=60000.0), atr=500.0
+        )
+        with self.assertRaises(SignalValidationError) as ctx:
+            validate_analysis(analysis)
+        self.assertIn("stale", str(ctx.exception))
+
+    def test_missing_atr_skips_atr_checks(self):
+        # make_analysis carries no ATR: identical levels must still pass.
+        candidate = validate_analysis(make_analysis())
+        self.assertEqual(candidate.entry, Decimal("61000.0"))

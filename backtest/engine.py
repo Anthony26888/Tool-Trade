@@ -31,6 +31,7 @@ mark-to-market, matching Phase 8).
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 
@@ -40,8 +41,7 @@ from demo.account import (
     DIRECTION_LONG,
     exit_fee as _exit_fee,
     gross_pnl,
-    position_quantity,
-    position_size,
+    resolve_quantity,
 )
 from signal_engine.analysis import SignalAnalysis
 from signal_engine.monitor import (
@@ -238,12 +238,22 @@ class BacktestEngine:
         config: BacktestConfig,
         data: HistoricalData,
         provider: BacktestDecisionProvider,
+        *,
+        blackout: Callable[[int], str | None] | None = None,
     ) -> None:
+        """Create the engine.
+
+        ``blackout`` is an optional ``decision_time_ms -> reason | None``
+        callable (Phase N): when it returns a reason the candle is recorded
+        as blocked (never analyzed, mirroring the live scheduler gate) while
+        TP/SL monitoring of an open position continues untouched.
+        """
         self.config = config
         self.data = data
         if provider is None:
             raise BacktestExecutionError("a BacktestDecisionProvider is required")
         self.provider = provider
+        self.blackout = blackout
         if data.symbol != config.symbol:
             raise BacktestExecutionError(
                 f"data symbol {data.symbol} does not match config symbol {config.symbol}"
@@ -306,7 +316,7 @@ class BacktestEngine:
             if not active.entered:
                 outcome = evaluate_entry(_levels(active), high, low)
                 if outcome is MonitorOutcome.ENTRY_HIT:
-                    self._open_position(active, minute_ts)
+                    self._open_position(active, minute_ts, balance)
                     entries_hit += 1
                 elif outcome is MonitorOutcome.AMBIGUOUS:
                     entry_ambiguity_count += 1
@@ -376,6 +386,21 @@ class BacktestEngine:
                     )
                 )
                 continue
+
+            if self.blackout is not None:
+                blackout_reason = self.blackout(decision_time)
+                if blackout_reason:
+                    blocked_count += 1
+                    blocked_events.append(
+                        BlockedEvent(
+                            candle_ts=candle.timestamp,
+                            decision_time_ms=decision_time,
+                            reason=f"event blackout: {blackout_reason}",
+                            active_direction=None,
+                            active_signal_candle_ts=None,
+                        )
+                    )
+                    continue
 
             window = hours[: i + 1]
             indicators = compute_indicator_matrix(window)
@@ -513,21 +538,28 @@ class BacktestEngine:
             final_balance=balance,
         )
 
-    def _open_position(self, active: _ActiveSignal, minute_ts: int) -> None:
+    def _open_position(self, active: _ActiveSignal, minute_ts: int, balance: Decimal) -> None:
         config = self.config
-        notional = position_size(config.margin_per_trade, config.leverage)
         factor = _slippage_factor(
             config.slippage_bps, direction=active.direction, entering=True
         )
         entry_exec = active.entry * factor
-        quantity = position_quantity(notional, entry_exec)
+        quantity, _rule = resolve_quantity(
+            balance,
+            config.margin_per_trade,
+            config.leverage,
+            config.risk_percent,
+            entry_exec,
+            active.stop_loss,
+        )
+        notional = quantity * entry_exec
         active.entered = True
         active.entry_time_ms = minute_ts
         active.entry_price = entry_exec
         active.quantity = quantity
         active.position_size = notional
         active.entry_fee = notional * config.fee_rate
-        active.risk_amount = abs(active.entry - active.stop_loss) * quantity
+        active.risk_amount = abs(entry_exec - active.stop_loss) * quantity
 
     def _close_position(
         self, active: _ActiveSignal, outcome: MonitorOutcome, minute_ts: int

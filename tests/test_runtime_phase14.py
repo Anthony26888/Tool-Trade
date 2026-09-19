@@ -17,11 +17,13 @@ import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from unittest.mock import patch
 
 import pytest
 
 from binance.market_data import Candle
 from database.database import (
+    CandleLogRepository,
     Database,
     DemoRepository,
     RuntimeStateRepository,
@@ -295,7 +297,7 @@ class TestRuntimeDaemon(unittest.TestCase):
                 "SHORT",
                 entry_price=59000.0,
                 stop_loss=60000.0,
-                take_profit=58000.0,
+                take_profit=57700.0,  # RR 1.3 >= Phase B minimum 1.2
             )
 
         class ShortAnalyzer:
@@ -441,6 +443,54 @@ class TestRuntimeDaemon(unittest.TestCase):
         )
         runtime._notify("notify_signal_opened", signal)
         self.assertEqual([m for m, _ in built.events], ["opened"])
+
+
+@pytest.mark.unit
+class TestRuntimeCandleLog(unittest.TestCase):
+    """Phase 16: the Runtime's default scheduler carries the candle log, so the
+    production daemon records one diagnostic row per analysed candle."""
+
+    def setUp(self):
+        self._tmp = TempDb()
+        self.addCleanup(self._tmp.close)
+
+    def _config_service(self):
+        return ConfigService(
+            self._tmp.db,
+            secrets_path=os.path.join(self._tmp._tmp.name, "secrets.json"),
+            env={},
+        )
+
+    def _runtime(self, md):
+        return Runtime(
+            RUN_CONFIG,
+            database=self._tmp.db,
+            market_data=md,
+            config_service=self._config_service(),
+        )
+
+    def test_default_scheduler_is_wired_with_candle_log(self):
+        md = ScriptedMarketData(
+            candles_1h=make_candles(DEFAULT_WINDOW_CANDLES), monitor_script=[]
+        )
+        runtime = self._runtime(md)
+        self.assertIsInstance(runtime.scheduler.candle_log, CandleLogRepository)
+
+    def test_poll_records_wait_row_in_candle_log(self):
+        md = ScriptedMarketData(
+            candles_1h=make_candles(DEFAULT_WINDOW_CANDLES), monitor_script=[]
+        )
+        runtime = self._runtime(md)
+        with patch("signal_engine.runtime.analyze_signal", return_value=make_analysis("WAIT")):
+            result = runtime.poll()
+        self.assertEqual(result["scheduler"], "WAIT")
+        rows = CandleLogRepository(self._tmp.db).list(limit=100)
+        self.assertEqual(len(rows), 1)
+        entry = rows[0]
+        self.assertEqual(entry.outcome, "WAIT")
+        self.assertEqual(entry.decision, "WAIT")
+        self.assertEqual(entry.symbol, "BTCUSDT")
+        self.assertIsNotNone(entry.recorded_at)
 
 
 @pytest.mark.unit

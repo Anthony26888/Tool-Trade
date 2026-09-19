@@ -34,7 +34,9 @@ from demo.account import (
     net_pnl,
     position_quantity,
     position_size,
+    resolve_quantity,
     risk_amount,
+    slippage_factor,
     total_fee,
     update_peak_equity,
     validate_config,
@@ -107,6 +109,8 @@ class TestDemoConfigValidation:
             {"risk_percent": Decimal("-1")},
             {"fee_rate": Decimal("-0.01")},
             {"fee_rate": Decimal("1")},
+            {"slippage_bps": Decimal("-1")},
+            {"slippage_bps": "wide"},
         ],
     )
     def test_invalid_config_rejected(self, kwargs):
@@ -140,6 +144,60 @@ class TestSizingAndQuantity:
     def test_quantity_rejects_nonpositive_entry(self):
         with pytest.raises(DemoCalculationError):
             position_quantity(Decimal("500"), Decimal("0"))
+
+
+class TestResolveQuantity:
+    """Phase F: explicit margin-vs-risk sizing rule (AGENTS.md section 16)."""
+
+    def test_margin_rule_wins_on_tight_stop(self):
+        # 500/61000 = 0.00819... vs risk 10/1000 = 0.01 -> margin binds.
+        qty, rule = resolve_quantity(1000, 50, 10, 1, 61000.0, 60000.0)
+        assert rule == "margin"
+        assert qty == Decimal("500") / Decimal("61000")
+
+    def test_risk_rule_wins_on_wide_stop(self):
+        # 500/61000 = 0.00819... vs risk 10/5000 = 0.002 -> risk binds.
+        qty, rule = resolve_quantity(1000, 50, 10, 1, 61000.0, 56000.0)
+        assert rule == "risk"
+        assert qty == Decimal("0.002")
+
+    def test_tie_prefers_margin(self):
+        # 500/50000 = 0.01 vs risk 10/1000 = 0.01 -> margin (legacy).
+        qty, rule = resolve_quantity(1000, 50, 10, 1, 50000.0, 49000.0)
+        assert rule == "margin"
+        assert qty == Decimal("0.01")
+
+    def test_short_uses_absolute_distance(self):
+        qty, rule = resolve_quantity(1000, 50, 10, 1, 59000.0, 60000.0)
+        assert rule == "margin"
+        assert qty == Decimal("500") / Decimal("59000")
+
+    def test_zero_stop_distance_rejected(self):
+        with pytest.raises(DemoCalculationError):
+            resolve_quantity(1000, 50, 10, 1, 61000.0, 61000.0)
+
+    def test_invalid_inputs_rejected(self):
+        with pytest.raises(DemoCalculationError):
+            resolve_quantity(0, 50, 10, 1, 61000.0, 60000.0)
+        with pytest.raises(DemoCalculationError):
+            resolve_quantity(1000, 50, 10, 1, -61000.0, 60000.0)
+
+
+class TestSlippageFactor:
+    def test_zero_is_identity(self):
+        assert slippage_factor(0, direction=LONG, entering=True) == Decimal("1")
+        assert slippage_factor(0, direction=SHORT, entering=False) == Decimal("1")
+
+    def test_adverse_direction(self):
+        # 10 bps: LONG pays up entering, gives up exiting; SHORT mirrors.
+        assert slippage_factor(10, direction=LONG, entering=True) == Decimal("1.001")
+        assert slippage_factor(10, direction=LONG, entering=False) == Decimal("0.999")
+        assert slippage_factor(10, direction=SHORT, entering=True) == Decimal("0.999")
+        assert slippage_factor(10, direction=SHORT, entering=False) == Decimal("1.001")
+
+    def test_negative_rejected(self):
+        with pytest.raises(DemoCalculationError):
+            slippage_factor(-1, direction=LONG, entering=True)
 
 
 class TestGrossPnl:

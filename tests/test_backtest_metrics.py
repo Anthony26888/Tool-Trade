@@ -108,6 +108,30 @@ def test_completed_trade_counts_and_pnl():
     assert stats.final_balance == Decimal("1037.8")
 
 
+def test_fee_eaten_gross_win_counts_as_loss():
+    # Gross +5 eaten by 3+3 fees = net -1: matches live demo/executor.py
+    # (net>0 is WIN), so it must count as a loss here too.
+    stats = _build_stats(
+        trades=[
+            make_trade(
+                0,
+                direction="LONG",
+                entry_price="60000",
+                exit_price="60050",
+                quantity=str(Q),
+                entry_fee="3",
+                exit_fee="3",
+                gross_pnl="5.0",
+                net_pnl="-1.0",
+                outcome="TP",
+            )
+        ]
+    )
+    assert stats.trades_completed == 1
+    assert stats.wins == 0
+    assert stats.losses == 1
+
+
 def test_rates_and_averages():
     stats = _build_stats()
     assert float(stats.win_rate) == pytest.approx(66.666666, abs=1e-5)

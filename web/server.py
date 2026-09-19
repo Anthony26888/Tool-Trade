@@ -12,6 +12,8 @@ JSON API (all responses are ``application/json`` with ``ok`` envelope):
     GET  /api/chart?interval=1h     -> OHLCV candles + active-signal overlay (1m/5m/15m/1h/4h)
     GET  /api/signals?limit=50&status=&direction=&since=&until=
                                             -> signal ledger history (filters optional)
+    GET  /api/daemon-log?limit=100&offset=&decision= -> per-candle daemon activity
+                                            log (why LONG/SHORT/WAIT/locked/error)
     GET  /api/trades?limit=50       -> demo trade ledger (immutable)
     GET  /api/statistics            -> win-rate / drawdown / fees / equity
     GET  /api/settings              -> masked settings + audit (NO secrets)
@@ -26,6 +28,7 @@ JSON API (all responses are ``application/json`` with ``ok`` envelope):
     DELETE /api/signals             -> delete signals by {"ids":[...]} or
                                        {"all":true}; OPEN signals never deleted;
                                        linked positions/trades cascade
+    DELETE /api/daemon-log          -> clear the per-candle daemon activity log
     POST /api/signal-chat                   -> Stream (ndjson) chat about the
                                                active signal (read-only)
 
@@ -55,6 +58,7 @@ from typing import Any
 from binance.client import BinanceError
 from binance.market_data import BinanceMarketData
 from database.database import (
+    CandleLogRepository,
     Database,
     DemoRepository,
     RuntimeStateRepository,
@@ -71,6 +75,7 @@ from signal_engine.config import (
     SettingsTestError,
     SettingsValidationError,
 )
+from signal_engine.event_calendar import EventCalendar
 from signal_engine.llm import LLMConfigError, build_llm_client
 from signal_engine.runtime import (
     RUNTIME_KEY_LAST_ERROR,
@@ -124,6 +129,48 @@ def _signal_json(signal) -> dict[str, Any]:
         "close_price": _jsonable(signal.close_price),
         "close_reason": signal.close_reason,
         "result": signal.result,
+    }
+
+
+def _candle_log_json(entry) -> dict[str, Any]:
+    """Serialize a Phase 16 candle-log entry for the web dashboard.
+
+    ``indicators`` is parsed from the stored JSON snapshot (a best-effort dict,
+    so a corrupt row renders as ``{}`` instead of breaking the API).
+    """
+    indicators: dict[str, Any] = {}
+    if entry.indicators_json:
+        try:
+            parsed = json.loads(entry.indicators_json)
+            if isinstance(parsed, dict):
+                indicators = parsed
+        except (ValueError, TypeError):  # pragma: no cover - defensive
+            indicators = {}
+    return {
+        "id": entry.id,
+        "symbol": entry.symbol,
+        "timeframe": entry.timeframe,
+        "candle_timestamp_ms": entry.candle_timestamp_ms,
+        "closed_at": entry.closed_at,
+        "recorded_at": entry.recorded_at,
+        "outcome": entry.outcome,
+        "decision": entry.decision,
+        "confidence": entry.confidence,
+        "entry": _jsonable(entry.entry),
+        "stop_loss": _jsonable(entry.stop_loss),
+        "take_profit": _jsonable(entry.take_profit),
+        "close_price": _jsonable(entry.close_price),
+        "signal_id": entry.signal_id,
+        "provider": entry.provider,
+        "model": entry.model,
+        "temperature": entry.temperature,
+        "reasoning": entry.reasoning,
+        "error_notes": entry.error_notes,
+        "indicators": indicators,
+        "llm_calls": entry.llm_calls,
+        "prompt_tokens": entry.prompt_tokens,
+        "completion_tokens": entry.completion_tokens,
+        "total_tokens": entry.total_tokens,
     }
 
 
@@ -196,6 +243,7 @@ class WebApplication:
         config_service: ConfigService | None = None,
         market_data: BinanceMarketData | None = None,
         chat_responder=None,
+        event_calendar: EventCalendar | None = None,
     ) -> None:
         self.database = database
         self.config = config if config is not None else runtime_config_from_env()
@@ -210,6 +258,14 @@ class WebApplication:
         )
         self._signals = SignalRepository(database)
         self._demo = DemoRepository(database)
+        self._candle_log = CandleLogRepository(database)
+        #: Phase N macro-event source (lazy: no I/O until first request).
+        self._events = (
+            event_calendar if event_calendar is not None else EventCalendar()
+        )
+        #: Phase P1 positioning cache: (epoch seconds, payload). Funding moves
+        #: every 8h and the LS ratio slowly; 60s keeps dashboard polling cheap.
+        self._pos_cache: tuple[float, dict[str, Any]] | None = None
         self._chart_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._price_cache: tuple[str, float, Any] | None = None
 
@@ -452,6 +508,100 @@ class WebApplication:
         trades = [_trade_json(DemoTrade.from_row(r)) for r in rows]
         return {"count": len(trades), "trades": trades}
 
+    def daemon_log(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        *,
+        decision: str | None = None,
+    ) -> dict[str, Any]:
+        """Read the Phase 16 per-candle daemon activity log (diagnostic only)."""
+        rows = self._candle_log.list(
+            limit=int(limit),
+            offset=int(offset),
+            decision=decision,
+        )
+        return {"count": len(rows), "rows": [_candle_log_json(r) for r in rows]}
+
+    def clear_daemon_log(self) -> dict[str, Any]:
+        """Delete every candle-log row; returns how many were removed."""
+        removed = self._candle_log.clear()
+        return {"cleared": removed}
+
+    def events(self) -> dict[str, Any]:
+        """Phase N banner payload: active blackout + upcoming releases.
+
+        Never raises: a dead calendar feed degrades to an empty payload and
+        the dashboard simply hides the banner (AGENTS.md 27).
+        """
+        try:
+            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+            status = self._events.check(now_ms)
+            return {
+                "active": status.active.to_dict() if status.active else None,
+                "upcoming": [e.to_dict() for e in status.upcoming[:4]],
+            }
+        except Exception as exc:
+            logger.warning("[Web] events payload failed: %s", exc)
+            return {"active": None, "upcoming": []}
+
+    def events_calendar(self, month: str | None) -> dict[str, Any]:
+        """Phase N month grid for the Events tab (``YYYY-MM``, default now)."""
+        try:
+            year, mon = datetime.now(timezone.utc).year, datetime.now(
+                timezone.utc
+            ).month
+            if isinstance(month, str):
+                parsed = datetime.strptime(month.strip(), "%Y-%m")
+                year, mon = parsed.year, parsed.month
+            days = self._events.month_events(year, mon)
+            return {
+                "month": f"{year:04d}-{mon:02d}",
+                "days": days,
+                "attribution": "https://www.financecalendar.com",
+            }
+        except Exception as exc:
+            logger.warning("[Web] events calendar failed: %s", exc)
+            return {"month": month or "", "days": {}, "attribution": ""}
+
+    def positioning(self) -> dict[str, Any]:
+        """Phase P1 live futures positioning (funding/OI/long-short).
+
+        Cached 60s; never raises — a dead feed returns ``available: False``
+        and the dashboard bar degrades gracefully (AGENTS.md 27).
+        """
+        import time as _time
+
+        try:
+            now = _time.time()
+            if self._pos_cache is not None and now - self._pos_cache[0] < 60.0:
+                return self._pos_cache[1]
+            from binance.positioning import fetch_positioning
+
+            client = getattr(self.market_data, "client", None)
+            symbol = self.config_service.resolve_symbol()
+            snapshot = fetch_positioning(client, symbol) if client is not None else None
+            if snapshot is None:
+                payload: dict[str, Any] = {"available": False, "symbol": symbol}
+            else:
+                payload = {
+                    "available": (
+                        snapshot.funding_rate is not None
+                        or snapshot.long_pct is not None
+                    ),
+                    "symbol": symbol,
+                    "funding_rate": snapshot.funding_rate,
+                    "funding_time_ms": snapshot.funding_time_ms,
+                    "open_interest": snapshot.open_interest,
+                    "long_pct": snapshot.long_pct,
+                    "short_pct": snapshot.short_pct,
+                }
+            self._pos_cache = (now, payload)
+            return payload
+        except Exception as exc:
+            logger.warning("[Web] positioning payload failed: %s", exc)
+            return {"available": False}
+
     def chart(self, interval: str = "1h", limit: int = 160, symbol: str | None = None) -> dict[str, Any]:
         """OHLCV candles plus the active-signal overlay for the price chart.
 
@@ -645,6 +795,24 @@ class _JsonHandler(BaseHTTPRequestHandler):
             elif path == "/api/trades":
                 limit = int(query.get("limit", ["50"])[0])
                 self._ok(self.app.trades(limit=limit))
+            elif path == "/api/daemon-log":
+                limit = int(query.get("limit", ["100"])[0])
+                offset = int(query.get("offset", ["0"])[0])
+                decision = query.get("decision", [""])[0] or None
+                self._ok(
+                    self.app.daemon_log(
+                        limit=limit,
+                        offset=offset,
+                        decision=decision,
+                    )
+                )
+            elif path == "/api/events":
+                self._ok(self.app.events())
+            elif path == "/api/events/calendar":
+                month = query.get("month", [""])[0] or None
+                self._ok(self.app.events_calendar(month))
+            elif path == "/api/positioning":
+                self._ok(self.app.positioning())
             elif path == "/api/settings":
                 self._ok({"settings": self.app.settings()})
             elif path == "/api/settings/ollama/models":
@@ -717,7 +885,9 @@ class _JsonHandler(BaseHTTPRequestHandler):
                 result = self.app.config_service.test_llm_connection(self._read_body())
                 self._ok({"result": result})
             elif parsed.path == "/api/settings/test-telegram":
-                self._ok({"result": self.app.config_service.test_telegram()})
+                body = self._read_body()
+                channel = str((body or {}).get("channel") or "reports")
+                self._ok({"result": self.app.config_service.test_telegram(channel)})
             elif parsed.path == "/api/demo/reset":
                 self._ok({"settings": self.app.config_service.reset_demo_account()})
             elif parsed.path == "/api/runtime/clear-error":
@@ -736,6 +906,8 @@ class _JsonHandler(BaseHTTPRequestHandler):
         try:
             if parsed.path == "/api/signals":
                 self._ok(self.app.delete_signals(self._read_body()))
+            elif parsed.path == "/api/daemon-log":
+                self._ok(self.app.clear_daemon_log())
             else:
                 self._json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
         except SettingsError as exc:

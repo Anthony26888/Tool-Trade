@@ -13,12 +13,18 @@ import sqlite3
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from signal_engine import SignalOutcome
+from database.models import (
+    STATUS_CANCELLED,
+    STATUS_OPEN,
+    STATUS_PENDING_ENTRY,
+)
+from signal_engine import GuardrailConfig, SignalOutcome
 from tests.signal_engine_test_helpers import TempSignalDb, make_analysis
 
 
@@ -27,7 +33,8 @@ def _long(**overrides):
 
 
 def _short(**overrides):
-    defaults = {"entry_price": 59000.0, "stop_loss": 60000.0, "take_profit": 58000.0}
+    # RR = 1300/1000 = 1.3: satisfies the Phase B minimum risk-reward (1.2).
+    defaults = {"entry_price": 59000.0, "stop_loss": 60000.0, "take_profit": 57700.0}
     defaults.update(overrides)
     return make_analysis("SHORT", **defaults)
 
@@ -295,12 +302,17 @@ class TestNumericValidation(EngineTestCase):
         self.assertEqual(self.repo.list_signals(), [])
 
     def test_decimal_comparison_semantics_no_binary_float(self):
+        # Guardrails relaxed on purpose: this test proves Decimal ordering
+        # precision, not trade structure (dust distances fail fee/RR rules).
+        relaxed = GuardrailConfig(
+            min_confidence=0, min_risk_reward=Decimal("0"), fee_rate=Decimal("0")
+        )
         near_order = _long(
             entry_price=Decimal("100"),
             stop_loss=Decimal("99.999999999999999999"),
             take_profit=Decimal("100.000000000000000001"),
         )
-        created = self.engine.process(near_order)
+        created = self.engine.process(near_order, guardrails=relaxed)
         self.assertEqual(created.outcome, SignalOutcome.CREATED)
         self.repo.cancel_signal(created.signal.id, close_reason="reset")
         self.assertFalse(self.engine.state.is_open())
@@ -312,6 +324,86 @@ class TestNumericValidation(EngineTestCase):
             take_profit=Decimal("100.5"),
         )
         self.assertEqual(self.engine.process(equal_levels).outcome, SignalOutcome.REJECTED)
+
+
+@pytest.mark.unit
+class TestPendingExpiry(EngineTestCase):
+    """Phase B: stale PENDING_ENTRY auto-expiry (default 6h)."""
+
+    def _old_pending(self, hours_ago: float, **overrides):
+        created = (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).strftime(
+            "%Y-%m-%dT%H:%M:%S.000Z"
+        )
+        return self.repo.create_signal(
+            symbol="BTCUSDT",
+            timeframe="1h",
+            direction="LONG",
+            entry=Decimal("61000.0"),
+            stop_loss=Decimal("60000.0"),
+            take_profit=Decimal("64000.0"),
+            confidence=80,
+            created_at=created,
+            **overrides,
+        )
+
+    def test_stale_pending_auto_cancelled_and_new_created(self):
+        old = self._old_pending(7.0)
+        result = self.engine.process(_long())
+        self.assertEqual(result.outcome, SignalOutcome.CREATED)
+        self.assertEqual(
+            self.repo.get_signal(old.id).status, STATUS_CANCELLED
+        )
+        self.assertEqual(result.signal.status, STATUS_PENDING_ENTRY)
+
+    def test_fresh_pending_still_blocked(self):
+        self._old_pending(1.0)
+        result = self.engine.process(_long())
+        self.assertEqual(result.outcome, SignalOutcome.BLOCKED_OPEN_SIGNAL)
+        self.assertEqual(len(self.repo.list_signals()), 1)
+
+    def test_stale_open_still_blocked(self):
+        old = self._old_pending(7.0)
+        self.repo.transition_signal(old.id, STATUS_OPEN)
+        result = self.engine.process(_long())
+        self.assertEqual(result.outcome, SignalOutcome.BLOCKED_OPEN_SIGNAL)
+        self.assertEqual(self.repo.get_signal(old.id).status, STATUS_OPEN)
+
+    def test_expiry_disabled_keeps_lock(self):
+        self._old_pending(30.0)
+        guards = GuardrailConfig(
+            min_confidence=0,
+            min_risk_reward=Decimal("0"),
+            fee_rate=Decimal("0"),
+            pending_expiry_hours=0,
+        )
+        result = self.engine.process(_long(), guardrails=guards)
+        self.assertEqual(result.outcome, SignalOutcome.BLOCKED_OPEN_SIGNAL)
+
+    def test_analyze_and_create_calls_analyzer_after_expiry(self):
+        self._old_pending(7.0)
+        calls: list = []
+
+        def analyzer(candles, indicators):
+            calls.append((candles, indicators))
+            return _long()
+
+        result = self.engine.analyze_and_create([], None, analyzer)
+        self.assertEqual(result.outcome, SignalOutcome.CREATED)
+        self.assertEqual(len(calls), 1)
+
+    def test_unparseable_created_at_never_expires(self):
+        self.repo.create_signal(
+            symbol="BTCUSDT",
+            timeframe="1h",
+            direction="LONG",
+            entry=Decimal("61000.0"),
+            stop_loss=Decimal("60000.0"),
+            take_profit=Decimal("64000.0"),
+            confidence=80,
+            created_at="not-a-date",
+        )
+        result = self.engine.process(_long())
+        self.assertEqual(result.outcome, SignalOutcome.BLOCKED_OPEN_SIGNAL)
 
 
 @pytest.mark.unit

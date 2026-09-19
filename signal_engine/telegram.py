@@ -35,7 +35,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -70,6 +70,8 @@ _MAX_BACKOFF_SECONDS = 10.0
 ENV_TELEGRAM_ENABLED = "BTCUSDT_TELEGRAM_ENABLED"
 ENV_TELEGRAM_BOT_TOKEN = "BTCUSDT_TELEGRAM_BOT_TOKEN"
 ENV_TELEGRAM_CHAT_ID = "BTCUSDT_TELEGRAM_CHAT_ID"
+ENV_TELEGRAM_CHAT_ID_SIGNALS = "BTCUSDT_TELEGRAM_CHAT_ID_SIGNALS"
+ENV_TELEGRAM_CHAT_ID_REPORTS = "BTCUSDT_TELEGRAM_CHAT_ID_REPORTS"
 ENV_TELEGRAM_TIMEOUT = "BTCUSDT_TELEGRAM_TIMEOUT"
 ENV_TELEGRAM_MAX_RETRIES = "BTCUSDT_TELEGRAM_MAX_RETRIES"
 ENV_TELEGRAM_BACKOFF = "BTCUSDT_TELEGRAM_BACKOFF"
@@ -89,20 +91,38 @@ class TelegramConfigError(ValueError, TelegramError):
 
 @dataclass(frozen=True)
 class TelegramConfig:
-    """Immutable Telegram notification configuration (like ``LLMConfig``).
+    """Immutable Telegram notification configuration (like ``LLMConfig``.
 
-    ``bot_token`` / ``chat_id`` are read from the environment; ``enabled``
+    ``bot_token`` / chat ids are read from the environment; ``enabled``
     defaults to ``False`` so the very first deployment silently does nothing.
     ``timeout`` bounds a single HTTP request; ``max_retries`` bounds the
     transient retry budget and ``backoff`` seeds its exponential delay.
+
+    Phase P6a runs one bot against two chats: ``chat_id_signals`` receives
+    the trade lifecycle (created/opened/TP/SL) while ``chat_id_reports``
+    receives everything else (daily report, event notices, errors). Either
+    may be empty: sending to a missing channel falls back to the other, and
+    ``chat_id`` is the legacy single-chat value filling both.
     """
 
     bot_token: str = ""
     chat_id: str = ""
+    chat_id_signals: str = ""
+    chat_id_reports: str = ""
     enabled: bool = False
     timeout: float = DEFAULT_TIMEOUT_SECONDS
     max_retries: int = DEFAULT_MAX_RETRIES
     backoff: float = DEFAULT_BACKOFF_SECONDS
+
+    @property
+    def signal_chat(self) -> str:
+        """Chat id for trade-lifecycle messages (legacy fills in)."""
+        return (self.chat_id_signals or "").strip() or (self.chat_id or "").strip()
+
+    @property
+    def report_chat(self) -> str:
+        """Chat id for reports/notices (legacy fills in)."""
+        return (self.chat_id_reports or "").strip() or (self.chat_id or "").strip()
 
 
 @dataclass(frozen=True)
@@ -263,7 +283,6 @@ def validate_telegram_config(config: TelegramConfig) -> TelegramConfig:
         return config
 
     token = str(config.bot_token or "").strip()
-    chat_id = str(config.chat_id or "").strip()
     if not token:
         raise TelegramConfigError(
             f"{ENV_TELEGRAM_BOT_TOKEN} is not set but Telegram is enabled"
@@ -272,9 +291,10 @@ def validate_telegram_config(config: TelegramConfig) -> TelegramConfig:
         raise TelegramConfigError(
             f"{ENV_TELEGRAM_BOT_TOKEN} is invalid (expected '<bot-id>:<auth-token>')"
         )
-    if not chat_id:
+    if not config.signal_chat and not config.report_chat:
         raise TelegramConfigError(
-            f"{ENV_TELEGRAM_CHAT_ID} is not set but Telegram is enabled"
+            f"{ENV_TELEGRAM_CHAT_ID_SIGNALS} or {ENV_TELEGRAM_CHAT_ID_REPORTS} "
+            f"(or legacy {ENV_TELEGRAM_CHAT_ID}) is not set but Telegram is enabled"
         )
     return config
 
@@ -314,9 +334,12 @@ def _env_int(env: dict, name: str, default: int) -> int:
 def telegram_config_from_env(env: dict | None = None) -> TelegramConfig:
     """Build a validated :class:`TelegramConfig` from environment variables."""
     env = dict(os.environ) if env is None else env
+    legacy_chat = str(env.get(ENV_TELEGRAM_CHAT_ID, "") or "").strip()
     config = TelegramConfig(
         bot_token=str(env.get(ENV_TELEGRAM_BOT_TOKEN, "") or ""),
-        chat_id=str(env.get(ENV_TELEGRAM_CHAT_ID, "") or "").strip(),
+        chat_id=legacy_chat,
+        chat_id_signals=str(env.get(ENV_TELEGRAM_CHAT_ID_SIGNALS, "") or "").strip(),
+        chat_id_reports=str(env.get(ENV_TELEGRAM_CHAT_ID_REPORTS, "") or "").strip(),
         enabled=_env_bool(env, ENV_TELEGRAM_ENABLED, default=False),
         timeout=_env_float(env, ENV_TELEGRAM_TIMEOUT, default=DEFAULT_TIMEOUT_SECONDS),
         max_retries=_env_int(env, ENV_TELEGRAM_MAX_RETRIES, default=DEFAULT_MAX_RETRIES),
@@ -492,7 +515,18 @@ class TelegramNotifier:
 
     def __init__(self, config: TelegramConfig, client: TelegramClient | None = None) -> None:
         self.config = config
-        self.client = client if client is not None else TelegramClient(config)
+        if client is not None:
+            # Injected sink (tests/fakes): both channels share it.
+            self._signal_client = client
+            self._report_client = client
+        else:
+            # One bot, two chats: trade lifecycle goes to the signals chat,
+            # everything else to the reports chat. A missing channel falls
+            # back to the other so no message is ever dropped silently.
+            signal_chat = config.signal_chat or config.report_chat
+            report_chat = config.report_chat or config.signal_chat
+            self._signal_client = TelegramClient(replace(config, chat_id=signal_chat))
+            self._report_client = TelegramClient(replace(config, chat_id=report_chat))
         #: Heuristic guard against re-sending the SAME ambiguous candle on
         #: repeated monitor polls (ambiguity is not a state transition, so
         #: transition-semantics alone cannot deduplicate it).
@@ -502,16 +536,19 @@ class TelegramNotifier:
     def enabled(self) -> bool:
         return self.config.enabled
 
-    def send_message(self, text: str) -> TelegramSendResult:
-        """Send one (truncated) message; never raises.
+    def send_message(self, text: str, *, channel: str = "report") -> TelegramSendResult:
+        """Send one (truncated) message to a channel; never raises.
 
-        The transport boundary catches everything the client itself cannot, so
-        the scheduler/monitor callers stay simple and trading stays safe.
+        ``channel`` is ``"report"`` (notices, daily summary) or ``"signal"``
+        (trade lifecycle). The transport boundary catches everything the
+        client itself cannot, so the scheduler/monitor callers stay simple
+        and trading stays safe.
         """
         if not self.config.enabled:
             return TelegramSendResult(ok=False, error="telegram disabled")
+        client = self._signal_client if channel == "signal" else self._report_client
         try:
-            result = self.client.send_message(_truncate(text))
+            result = client.send_message(_truncate(text))
         except Exception:  # pragma: no cover - defensive transport boundary
             logger.warning("Telegram send failed without a result: %s", "transport failure")
             return TelegramSendResult(ok=False, error="Telegram send failed unexpectedly")
@@ -520,20 +557,20 @@ class TelegramNotifier:
         return result
 
     def notify_signal_created(self, signal: Signal, *, candle_ts: int | None = None) -> TelegramSendResult:
-        return self.send_message(format_signal_created(signal, candle_ts=candle_ts))
+        return self.send_message(format_signal_created(signal, candle_ts=candle_ts), channel="signal")
 
     def notify_signal_opened(self, signal: Signal) -> TelegramSendResult:
-        return self.send_message(format_signal_opened(signal))
+        return self.send_message(format_signal_opened(signal), channel="signal")
 
     def notify_signal_tp(
         self, signal: Signal, *, pnl: Decimal | None = None, balance: Decimal | None = None
     ) -> TelegramSendResult:
-        return self.send_message(format_signal_tp(signal, pnl=pnl, balance=balance))
+        return self.send_message(format_signal_tp(signal, pnl=pnl, balance=balance), channel="signal")
 
     def notify_signal_sl(
         self, signal: Signal, *, pnl: Decimal | None = None, balance: Decimal | None = None
     ) -> TelegramSendResult:
-        return self.send_message(format_signal_sl(signal, pnl=pnl, balance=balance))
+        return self.send_message(format_signal_sl(signal, pnl=pnl, balance=balance), channel="signal")
 
     def notify_ambiguous(
         self, signal: Signal, reason: str = "", *, candle_ts: int | None = None
@@ -612,6 +649,9 @@ class RefreshableTelegramNotifier:
             self._current(), "notify_ambiguous", signal, reason, candle_ts=candle_ts
         )
 
+    def send_message(self, text: str, *args: Any, **kwargs: Any) -> TelegramSendResult:
+        return self._delegate(self._current(), "send_message", text, *args, **kwargs)
+
 
 __all__ = [
     "DEFAULT_BACKOFF_SECONDS",
@@ -620,6 +660,8 @@ __all__ = [
     "ENV_TELEGRAM_BACKOFF",
     "ENV_TELEGRAM_BOT_TOKEN",
     "ENV_TELEGRAM_CHAT_ID",
+    "ENV_TELEGRAM_CHAT_ID_REPORTS",
+    "ENV_TELEGRAM_CHAT_ID_SIGNALS",
     "ENV_TELEGRAM_ENABLED",
     "ENV_TELEGRAM_MAX_RETRIES",
     "ENV_TELEGRAM_TIMEOUT",

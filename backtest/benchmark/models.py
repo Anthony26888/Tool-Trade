@@ -25,7 +25,8 @@ from typing import Any
 
 #: Bump when the decision context/prompt changes so stale cached decisions are
 #: never reused. Keys are scoped to this version.
-CONTEXT_VERSION = 1
+#: v2: Phase N appends the scheduled-event note section to the context.
+CONTEXT_VERSION = 2
 
 #: Cap the reasoning text persisted per decision so files stay readable.
 _REASONING_CAP = 4000

@@ -24,6 +24,7 @@ from signal_engine import (
     ENV_LLM_MAX_TOKENS,
     ENV_LLM_MODEL,
     ENV_LLM_PROVIDER,
+    ENV_LLM_TEMPERATURE,
     ENV_LLM_TIMEOUT,
     SIGNAL_MODELS,
     LLMConfig,
@@ -168,6 +169,34 @@ class TestEnvCoercion(unittest.TestCase):
     def test_bad_timeout_raises(self):
         with self.assertRaises(LLMConfigError):
             llm_config_from_env({ENV_LLM_TIMEOUT: "30s"})
+
+    def test_timeout_retry_defaults_pinned(self):
+        # Phase E: unset values resolve to explicit numbers instead of
+        # unverified SDK-version defaults.
+        config = llm_config_from_env({})
+        self.assertEqual(config.timeout, 120.0)
+        self.assertEqual(config.max_retries, 2)
+        self.assertIsNone(config.temperature)
+
+    def test_nonpositive_timeout_rejected(self):
+        for bad in ("0", "-5", "0.0"):
+            with self.subTest(bad=bad), self.assertRaises(LLMConfigError) as ctx:
+                llm_config_from_env({ENV_LLM_TIMEOUT: bad})
+            self.assertIn(ENV_LLM_TIMEOUT, str(ctx.exception))
+
+    def test_negative_max_retries_rejected(self):
+        with self.assertRaises(LLMConfigError) as ctx:
+            llm_config_from_env({ENV_LLM_MAX_RETRIES: "-1"})
+        self.assertIn(ENV_LLM_MAX_RETRIES, str(ctx.exception))
+
+    def test_temperature_range_enforced(self):
+        for good in ("0", "0.2", "5"):
+            config = llm_config_from_env({ENV_LLM_TEMPERATURE: good})
+            self.assertAlmostEqual(config.temperature, float(good))
+        for bad in ("-0.1", "5.5", "99"):
+            with self.subTest(bad=bad), self.assertRaises(LLMConfigError) as ctx:
+                llm_config_from_env({ENV_LLM_TEMPERATURE: bad})
+            self.assertIn(ENV_LLM_TEMPERATURE, str(ctx.exception))
 
 
 @pytest.mark.unit

@@ -3,15 +3,16 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#0b1117" />
   <title>NEXTRA AI — BTCUSDT Signal Engine</title>
-  <link rel="icon" type="image/png" href="/static/logo.png" />
+  <link rel="icon" type="image/png" href="/static/ai.png" />
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
   <div class="app">
     <aside class="sidebar">
       <div class="brand">
-        <img class="brand-logo" src="/static/logo.png" alt="NEXTRA AI" />
+        <img class="brand-logo" src="/static/ai.png" alt="NEXTRA AI" />
         <div>
           <div class="brand-title">NEXTRA AI</div>
           <div class="brand-sub">Signal Engine</div>
@@ -20,6 +21,8 @@
       <nav class="nav">
         <button class="nav-item active" data-panel="dashboard">Dashboard</button>
         <button class="nav-item" data-panel="signals">Signals</button>
+        <button class="nav-item" data-panel="daemon">Daemon Log</button>
+        <button class="nav-item" data-panel="events">Events</button>
         <button class="nav-item" data-panel="trades">Trades</button>
         <button class="nav-item" data-panel="statistics">Statistics</button>
         <button class="nav-item" data-panel="settings">Settings</button>
@@ -38,8 +41,16 @@
         </div>
         <div class="topbar-right">
           <span id="statusPill" class="status-pill">—</span>
+          <button type="button" id="eventsBtn" class="icon-btn" title="Macro events calendar" aria-label="Macro events calendar">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>
+          </button>
+          <button type="button" id="settingsGear" class="gear-btn" title="Settings" aria-label="Settings">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+          </button>
         </div>
       </header>
+
+      <button type="button" id="eventBanner" class="event-banner" hidden></button>
 
       <section id="panel-dashboard" class="panel active">
         <div class="cards" id="dashboardCards"></div>
@@ -70,6 +81,7 @@
             <div id="chartMsg" class="chart-msg"></div>
           </div>
           <div id="chartLegend" class="chart-legend"><span class="muted">Chart updates every 15s</span></div>
+          <div id="lsBar" class="ls-bar"><span class="muted">Positioning…</span></div>
         </section>
         <div class="grid-2">
           <section class="card">
@@ -123,11 +135,65 @@
         </section>
       </section>
 
+      <section id="panel-daemon" class="panel">
+        <section class="card">
+          <h2 class="card-title">Daemon Activity per 1H Candle</h2>
+          <div class="toolbar">
+            <label class="toolbar-item">Decision
+              <select id="ddDir">
+                <option value="">All</option>
+                <option value="LONG">LONG</option>
+                <option value="SHORT">SHORT</option>
+                <option value="WAIT">WAIT</option>
+                <option value="NONE">NONE (locked/error)</option>
+              </select>
+            </label>
+            <label class="toolbar-item">Time (VN)
+              <select id="ddTime">
+                <option value="">All</option>
+                <option value="today">Today</option>
+                <option value="7d">7 days</option>
+                <option value="30d">30 days</option>
+              </select>
+            </label>
+            <button class="btn danger toolbar-item" id="ddClear" type="button">Clear log</button>
+            <span class="hint toolbar-item">Click a row for reasoning, indicator snapshot &amp; prices.</span>
+          </div>
+          <div class="table-wrap" id="daemonTable"><p class="muted">Loading…</p></div>
+        </section>
+      </section>
+
       <section id="panel-trades" class="panel">
         <section class="card">
           <h2 class="card-title">Demo Trades</h2>
           <div class="table-wrap" id="tradesTable"><p class="muted">Loading…</p></div>
         </section>
+      </section>
+
+      <section id="panel-events" class="panel">
+        <section class="card">
+          <div class="card-head">
+            <h2 class="card-title">Macro Events — new positions pause inside ⏸ windows</h2>
+            <div class="cal-nav">
+              <button type="button" id="calPrev" class="btn" title="Previous month">‹</button>
+              <button type="button" id="calToday" class="btn secondary" title="Back to this month">Today</button>
+              <button type="button" id="calNext" class="btn" title="Next month">›</button>
+            </div>
+          </div>
+          <h3 class="cal-month" id="calMonth">—</h3>
+          <div class="cal-grid cal-week" aria-hidden="true">
+            <span>T2</span><span>T3</span><span>T4</span><span>T5</span><span>T6</span><span>T7</span><span>CN</span>
+          </div>
+          <div class="cal-grid" id="calGrid"><p class="muted">Loading…</p></div>
+          <p class="hint">Tap a day for details. Times in Vietnam (+07). Calendar data: <a href="https://www.financecalendar.com" target="_blank" rel="noopener">financecalendar.com</a></p>
+        </section>
+        <dialog id="eventDialog" class="event-dialog">
+          <div class="event-dialog-head">
+            <h3 id="eventDialogTitle">—</h3>
+            <button type="button" id="eventDialogClose" class="btn secondary" aria-label="Close">✕</button>
+          </div>
+          <div id="eventDialogBody"></div>
+        </dialog>
       </section>
 
       <section id="panel-statistics" class="panel">
@@ -204,6 +270,35 @@
       <button type="button" id="chatClear" class="btn secondary" title="Clear conversation">Clear</button>
     </div>
   </aside>
+
+  <nav class="bottom-nav" aria-label="Mobile navigation">
+    <button type="button" class="nav-item" data-panel="signals" title="Signals">
+      <span class="nav-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 17l5-6 4 3 6-8"/><path d="M18 6h3v3"/></svg></span>
+      <span class="nav-label">Signals</span>
+    </button>
+    <button type="button" class="nav-item" data-panel="daemon" title="Daemon Log">
+      <span class="nav-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></span>
+      <span class="nav-label">Daemon</span>
+    </button>
+    <button type="button" class="nav-item nav-center" data-panel="dashboard" title="Dashboard">
+      <span class="nav-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 10.5L12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M10 21v-5h4v5"/></svg></span>
+      <span class="nav-label">Dashboard</span>
+    </button>
+    <button type="button" class="nav-item" data-panel="trades" title="Trades">
+      <span class="nav-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3v14"/><path d="M4 7l4-4 4 4"/><path d="M16 21V7"/><path d="M12 17l4 4 4-4"/></svg></span>
+      <span class="nav-label">Trades</span>
+    </button>
+    <button type="button" class="nav-item" data-panel="statistics" title="Statistics">
+      <span class="nav-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20h16"/><path d="M7 20v-6"/><path d="M12 20V9"/><path d="M17 20v-8"/></svg></span>
+      <span class="nav-label">Stats</span>
+    </button>
+  </nav>
+
+  <div id="loading" class="loading hidden" role="status" aria-live="polite">
+    <div class="loading-ring">
+      <img class="loading-logo" src="/static/ai.png" alt="Loading" />
+    </div>
+  </div>
 
   <div id="toast" class="toast"></div>
   <script src="/static/app.js"></script>

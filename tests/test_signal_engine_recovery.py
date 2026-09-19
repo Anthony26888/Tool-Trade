@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal
 from unittest.mock import patch
 
 import pytest
@@ -91,9 +92,20 @@ class RecoveryTestCase(unittest.TestCase):
         return result.signal
 
     def _create_short(self, **overrides):
+        from signal_engine import GuardrailConfig
+
         defaults = {"entry_price": 59000.0, "stop_loss": 60000.0, "take_profit": 58000.0}
         defaults.update(overrides)
-        result = self.harness.engine.process(make_analysis("SHORT", **defaults))
+        # Guardrails relaxed on purpose: recovery tests need symmetric
+        # boundary levels; policy gets dedicated validator tests.
+        relaxed = GuardrailConfig(
+            min_confidence=0,
+            min_risk_reward=Decimal("0"),
+            fee_rate=Decimal("0"),
+        )
+        result = self.harness.engine.process(
+            make_analysis("SHORT", **defaults), guardrails=relaxed
+        )
         self.assertEqual(result.outcome.value, "CREATED")
         return result.signal
 

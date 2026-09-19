@@ -9,17 +9,23 @@ the interaction with the independent TP/SL monitor.
 
 from __future__ import annotations
 
+import os
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import patch
 
 import pytest
 
 from binance.market_data import Candle
-from database.database import Database, SchedulerStateRepository, SignalRepository
+from database.database import (
+    CandleLogRepository,
+    Database,
+    SchedulerStateRepository,
+    SignalRepository,
+)
 from database.models import (
     STATUS_CANCELLED,
     STATUS_OPEN,
@@ -397,7 +403,7 @@ class TestDecisions(SchedulerTestCase):
                 "SHORT",
                 entry_price=59000.0,
                 stop_loss=60000.0,
-                take_profit=58000.0,
+                take_profit=57700.0,  # RR 1.3 >= Phase B minimum 1.2
             )
         )
         result = sched.tick(now=NOW)
@@ -474,16 +480,190 @@ class TestFailureSafety(SchedulerTestCase):
         self.assertEqual(retry.outcome, SchedulerOutcome.ERROR)
         self.assertEqual(len(calls), 2)
 
-    def test_rejected_analysis_is_error_no_marker(self):
+    def test_breaker_opens_after_n_consecutive_errors(self):
+        # Phase E: after N ERRORs the breaker skips LLM work (no new calls)
+        # until the cooldown expires.
+        calls: list = []
         sched = self.make_scheduler(
-            analyzer=lambda c, i: make_analysis(
+            analyzer=make_analyzer(SignalAnalysisError("provider 500"), calls)
+        )
+        with patch.dict(
+            os.environ,
+            {"BTCUSDT_ERROR_BREAKER_N": "3", "BTCUSDT_ERROR_BREAKER_COOLDOWN_S": "600"},
+        ):
+            for _ in range(3):
+                self.assertEqual(
+                    sched.tick(now=NOW).outcome, SchedulerOutcome.ERROR
+                )
+            self.assertEqual(len(calls), 3)
+            skipped = sched.tick(now=NOW)
+            self.assertEqual(skipped.outcome, SchedulerOutcome.DATA_UNAVAILABLE)
+            self.assertIn("circuit breaker", skipped.message)
+            self.assertEqual(len(calls), 3)
+
+    def test_breaker_success_resets_streak(self):
+        outcomes = [
+            SignalAnalysisError("flaky"),
+            SignalAnalysisError("flaky"),
+            "WAIT",
+            SignalAnalysisError("flaky"),
+            SignalAnalysisError("flaky"),
+        ]
+        calls: list = []
+        states = list(outcomes)
+
+        def flapping(candles, indicators):
+            calls.append((candles, indicators))
+            decision = states.pop(0)
+            if isinstance(decision, Exception):
+                raise decision
+            return make_analysis(decision)
+
+        from tests.signal_engine_test_helpers import make_candles as _fresh_candles
+
+        sched = self.make_scheduler(analyzer=flapping)
+        with patch.dict(os.environ, {"BTCUSDT_ERROR_BREAKER_N": "3"}):
+            for step, _ in enumerate(outcomes):
+                # Each tick sees a newer candle (ERROR/WAIT never share one).
+                sched.market_data = FakeSchedulerData(
+                    *_fresh_candles(DEFAULT_WINDOW_CANDLES + step)
+                )
+                result = sched.tick(now=NOW)
+                expected = (
+                    SchedulerOutcome.ERROR
+                    if isinstance(outcomes[step], Exception)
+                    else SchedulerOutcome.WAIT
+                )
+                self.assertEqual(result.outcome, expected)
+            # Streak reset by WAIT: no breaker trip, all 5 analyses ran.
+            self.assertEqual(len(calls), 5)
+
+    def test_breaker_half_open_retries_after_cooldown(self):
+        calls: list = []
+        sched = self.make_scheduler(
+            analyzer=make_analyzer(SignalAnalysisError("down"), calls)
+        )
+        env = {"BTCUSDT_ERROR_BREAKER_N": "2", "BTCUSDT_ERROR_BREAKER_COOLDOWN_S": "600"}
+        with patch.dict(os.environ, env):
+            t0 = NOW
+            self.assertEqual(sched.tick(now=t0).outcome, SchedulerOutcome.ERROR)
+            t1 = t0 + timedelta(seconds=30)
+            self.assertEqual(sched.tick(now=t1).outcome, SchedulerOutcome.ERROR)
+            # Breaker open until t1+600s: skipped tick makes no LLM call.
+            t2 = t0 + timedelta(seconds=40)
+            skipped = sched.tick(now=t2)
+            self.assertEqual(skipped.outcome, SchedulerOutcome.DATA_UNAVAILABLE)
+            self.assertIn("circuit breaker", skipped.message)
+            self.assertEqual(len(calls), 2)
+            # Past cooldown: half-open tick calls the LLM again.
+            t3 = t0 + timedelta(seconds=640)
+            self.assertEqual(sched.tick(now=t3).outcome, SchedulerOutcome.ERROR)
+            self.assertEqual(len(calls), 3)
+
+    def test_breaker_disabled_at_zero(self):
+        calls: list = []
+        sched = self.make_scheduler(
+            analyzer=make_analyzer(SignalAnalysisError("down"), calls)
+        )
+        with patch.dict(os.environ, {"BTCUSDT_ERROR_BREAKER_N": "0"}):
+            for _ in range(6):
+                self.assertEqual(
+                    sched.tick(now=NOW).outcome, SchedulerOutcome.ERROR
+                )
+            self.assertEqual(len(calls), 6)
+
+    def test_breaker_settings_fallback(self):
+        from signal_engine.scheduler import _breaker_settings
+
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(_breaker_settings(), (5, 600.0))
+        with patch.dict(
+            os.environ,
+            {"BTCUSDT_ERROR_BREAKER_N": "3", "BTCUSDT_ERROR_BREAKER_COOLDOWN_S": "60"},
+        ):
+            self.assertEqual(_breaker_settings(), (3, 60.0))
+        with patch.dict(os.environ, {"BTCUSDT_ERROR_BREAKER_N": "0"}):
+            self.assertEqual(_breaker_settings(), (0, 0.0))
+        with patch.dict(os.environ, {"BTCUSDT_ERROR_BREAKER_N": "many"}):
+            self.assertEqual(_breaker_settings(), (5, 600.0))
+
+    def test_rejected_analysis_is_marked_no_retry(self):
+        # Phase A token guard: a validation failure records the candle as
+        # processed so the same candle never burns another LLM call.
+        calls: list = []
+
+        def bad_analyzer(candles, indicators):
+            calls.append((candles, indicators))
+            return make_analysis(
                 "LONG", entry_price=59000.0, stop_loss=60000.0, take_profit=64000.0
+            )
+
+        sched = self.make_scheduler(analyzer=bad_analyzer)
+        result = sched.tick(now=NOW)
+        self.assertEqual(result.outcome, SchedulerOutcome.REJECTED)
+        self.assertIsNone(result.signal)
+        self.assertFalse(self.harness.repository.list_signals())
+        self.assertEqual(
+            SchedulerStateRepository(self.harness.db).last_processed_candle(
+                "BTCUSDT", "1h"
+            ),
+            latest_ms(self.candles),
+        )
+        retry = sched.tick(now=NOW)
+        self.assertEqual(retry.outcome, SchedulerOutcome.ALREADY_PROCESSED)
+        self.assertEqual(len(calls), 1)
+
+    def test_rejected_marker_write_failure_is_error(self):
+        def bad_analyzer(candles, indicators):
+            return make_analysis(
+                "LONG", entry_price=59000.0, stop_loss=60000.0, take_profit=64000.0
+            )
+
+        sched = self.make_scheduler(analyzer=bad_analyzer)
+        with patch.object(
+            SchedulerStateRepository,
+            "record_processed_candle",
+            side_effect=RuntimeError("disk readonly"),
+        ):
+            result = sched.tick(now=NOW)
+        self.assertEqual(result.outcome, SchedulerOutcome.ERROR)
+
+    def test_rate_limited_is_marked_no_retry(self):
+        # A provider 429 must skip the candle instead of retrying every poll.
+        from signal_engine.analysis import RateLimitedError
+
+        calls: list = []
+        sched = self.make_scheduler(
+            analyzer=make_analyzer(
+                RateLimitedError("LLM rate limit: Error code 429"), calls
             )
         )
         result = sched.tick(now=NOW)
-        self.assertEqual(result.outcome, SchedulerOutcome.ERROR)
+        self.assertEqual(result.outcome, SchedulerOutcome.RATE_LIMITED)
         self.assertIsNone(result.signal)
-        self.assertFalse(self.harness.repository.list_signals())
+        self.assertEqual(
+            SchedulerStateRepository(self.harness.db).last_processed_candle(
+                "BTCUSDT", "1h"
+            ),
+            latest_ms(self.candles),
+        )
+        retry = sched.tick(now=NOW)
+        self.assertEqual(retry.outcome, SchedulerOutcome.ALREADY_PROCESSED)
+        self.assertEqual(len(calls), 1)
+
+    def test_rate_limited_marker_write_failure_is_error(self):
+        from signal_engine.analysis import RateLimitedError
+
+        sched = self.make_scheduler(
+            analyzer=make_analyzer(RateLimitedError("429"), calls=[])
+        )
+        with patch.object(
+            SchedulerStateRepository,
+            "record_processed_candle",
+            side_effect=RuntimeError("disk readonly"),
+        ):
+            result = sched.tick(now=NOW)
+        self.assertEqual(result.outcome, SchedulerOutcome.ERROR)
 
     def test_wait_marker_write_failure_is_error_not_wait(self):
         calls: list = []
@@ -688,7 +868,9 @@ class TestSchedulerContract(unittest.TestCase):
         self.assertTrue(md.calls)
         for symbol, interval, _, _ in md.calls:
             self.assertEqual(symbol, "BTCUSDT")
-            self.assertEqual(interval, SCHEDULER_INTERVAL)
+            # 1H analysis candles plus the Phase P2 4H bias fetch (closed
+            # klines only, never orders); nothing else may hit market data.
+            self.assertIn(interval, (SCHEDULER_INTERVAL, "4h"))
 
     def test_no_real_client_and_no_order_paths(self):
         with patch("signal_engine.scheduler.BinanceMarketData") as cls:
@@ -808,6 +990,183 @@ class TestSchedulerStateRepository(unittest.TestCase):
                 store.record_processed_candle("BTCUSDT", "1h", bad, "t")
         with self.assertRaises(SignalValidationError):
             store.record_processed_candle("BTCUSDT", "1h", 1, "")
+
+
+# ── F. Per-candle daemon activity log (Phase 16) ─────────────────────────────
+
+
+@pytest.mark.unit
+class TestCandleLog(SchedulerTestCase):
+    """One diagnostic row per analysed candle: WAIT/CREATED/ERROR/BLOCKED are
+    recorded; NO_NEW_CANDLE / ALREADY_PROCESSED are not."""
+
+    def build(self, **kwargs):
+        kwargs.setdefault("candle_log", CandleLogRepository(self.harness.db))
+        return self.make_scheduler(**kwargs)
+
+    def rows(self):
+        return CandleLogRepository(self.harness.db).list(limit=100)
+
+    def test_wait_is_logged_with_decision_confidence_and_closed_at(self):
+        calls: list = []
+        sched = self.build(analyzer=make_analyzer("WAIT", calls))
+        result = sched.tick(now=NOW)
+        self.assertEqual(result.outcome, SchedulerOutcome.WAIT)
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        entry = rows[0]
+        self.assertEqual(entry.outcome, "WAIT")
+        self.assertEqual(entry.decision, "WAIT")
+        self.assertEqual(entry.confidence, 80)
+        self.assertEqual(entry.candle_timestamp_ms, latest_ms(self.candles))
+        self.assertEqual(entry.symbol, "BTCUSDT")
+        self.assertEqual(entry.timeframe, "1h")
+        self.assertTrue(entry.recorded_at)
+        self.assertTrue(entry.closed_at)
+        self.assertIsNotNone(entry.reasoning)
+        self.assertIsNone(entry.signal_id)
+        self.assertIsNone(entry.error_notes)
+
+    def test_quota_recorded_from_analysis(self):
+        import dataclasses
+
+        def analyzer(candles, indicators):
+            base = make_analysis("WAIT")
+            return dataclasses.replace(
+                base, llm_calls=5, prompt_tokens=10500,
+                completion_tokens=1800, total_tokens=12300,
+            )
+
+        sched = self.build(analyzer=analyzer)
+        self.assertEqual(sched.tick(now=NOW).outcome, SchedulerOutcome.WAIT)
+        entry = self.rows()[0]
+        self.assertEqual(entry.llm_calls, 5)
+        self.assertEqual(entry.prompt_tokens, 10500)
+        self.assertEqual(entry.completion_tokens, 1800)
+        self.assertEqual(entry.total_tokens, 12300)
+
+    def test_quota_defaults_single_call_without_tokens(self):
+        calls: list = []
+        sched = self.build(analyzer=make_analyzer("WAIT", calls))
+        self.assertEqual(sched.tick(now=NOW).outcome, SchedulerOutcome.WAIT)
+        entry = self.rows()[0]
+        self.assertEqual(entry.llm_calls, 1)
+        self.assertIsNone(entry.prompt_tokens)
+        self.assertIsNone(entry.total_tokens)
+
+    def test_error_row_records_zero_calls(self):
+        calls: list = []
+        sched = self.build(
+            analyzer=make_analyzer(SignalAnalysisError("LLM failed"), calls)
+        )
+        self.assertEqual(sched.tick(now=NOW).outcome, SchedulerOutcome.ERROR)
+        entry = self.rows()[0]
+        self.assertEqual(entry.llm_calls, 0)
+        self.assertIsNone(entry.prompt_tokens)
+
+    def test_created_is_logged_with_signal_id_and_prices(self):
+        calls: list = []
+        sched = self.build(analyzer=make_analyzer("LONG", calls))
+        result = sched.tick(now=NOW)
+        self.assertEqual(result.outcome, SchedulerOutcome.CREATED)
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        entry = rows[0]
+        self.assertEqual(entry.outcome, "CREATED")
+        self.assertEqual(entry.decision, "LONG")
+        self.assertEqual(entry.signal_id, result.signal.id)
+        self.assertEqual(entry.entry, "61000.0")
+        self.assertEqual(entry.stop_loss, "60000.0")
+        self.assertEqual(entry.take_profit, "64000.0")
+        self.assertIsNotNone(entry.indicators_json)
+        import json
+        snapshot = json.loads(entry.indicators_json)
+        self.assertIn("close", snapshot)
+
+    def test_active_signal_block_is_logged_without_calling_ai(self):
+        repo = SignalRepository(self.harness.db)
+        # A signal opened on the PREVIOUS candle, still active; the newest
+        # candle N closes and must be skipped without any AI call.
+        repo.create_signal(
+            "BTCUSDT", "1h", "LONG", "61000", "60000", "64000",
+            market_timestamp=iso_from_ms(latest_ms(self.candles) - INTERVAL_MS),
+        )
+        calls: list = []
+        sched = self.build(analyzer=make_analyzer("LONG", calls))
+        result = sched.tick(now=NOW)
+        self.assertEqual(result.outcome, SchedulerOutcome.BLOCKED_ACTIVE_SIGNAL)
+        self.assertEqual(len(calls), 0)
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        entry = rows[0]
+        self.assertEqual(entry.outcome, "BLOCKED_ACTIVE_SIGNAL")
+        self.assertEqual(entry.decision, "NONE")
+        self.assertIsNotNone(entry.error_notes)
+
+    def test_data_unavailable_is_logged(self):
+        from binance.client import BinanceConnectionError
+
+        calls: list = []
+        sched = self.build(
+            md=FakeSchedulerData(error=BinanceConnectionError("timeout")),
+            analyzer=make_analyzer("LONG", calls),
+        )
+        result = sched.tick(now=NOW)
+        self.assertEqual(result.outcome, SchedulerOutcome.DATA_UNAVAILABLE)
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        entry = rows[0]
+        self.assertEqual(entry.outcome, "DATA_UNAVAILABLE")
+        self.assertEqual(entry.decision, "NONE")
+        self.assertIn("BinanceConnectionError", entry.error_notes)
+
+    def test_ai_error_is_logged(self):
+        calls: list = []
+        sched = self.build(
+            analyzer=make_analyzer(SignalAnalysisError("LLM failed"), calls)
+        )
+        result = sched.tick(now=NOW)
+        self.assertEqual(result.outcome, SchedulerOutcome.ERROR)
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].outcome, "ERROR")
+        self.assertEqual(rows[0].decision, "NONE")
+        self.assertIn("LLM failed", rows[0].error_notes)
+
+    def test_retry_of_failed_candle_keeps_one_row(self):
+        calls: list = []
+        sched = self.build(analyzer=make_analyzer(SignalAnalysisError("LLM failed"), calls))
+        self.assertEqual(sched.tick(now=NOW).outcome, SchedulerOutcome.ERROR)
+        # Also run the scheduler without a candle log to prove the guard.
+        plain = self.make_scheduler(analyzer=make_analyzer(SignalAnalysisError("x"), calls))
+        self.assertEqual(plain.tick(now=NOW).outcome, SchedulerOutcome.ERROR)
+        self.assertEqual(sched.tick(now=NOW).outcome, SchedulerOutcome.ERROR)
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].outcome, "ERROR")
+
+    def test_no_new_candle_and_already_processed_are_not_logged(self):
+        calls: list = []
+        sched = self.build(analyzer=make_analyzer("WAIT", calls))
+        sched.tick(now=NOW)
+        # Same candle -> ALREADY_PROCESSED, no extra row.
+        sched.tick(now=NOW)
+        # A marker ahead of the market -> NO_NEW_CANDLE, no extra row.
+        future = latest_ms(self.candles) + INTERVAL_MS
+        SchedulerStateRepository(self.harness.db).record_processed_candle(
+            "BTCUSDT", "1h", future, "2026-09-10T12:00:00.000Z"
+        )
+        sched.tick(now=NOW)
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].outcome, "WAIT")
+
+    def test_candle_log_disabled_by_default(self):
+        calls: list = []
+        sched = self.make_scheduler(analyzer=make_analyzer("LONG", calls))
+        sched.tick(now=NOW)
+        rows = self.rows()
+        self.assertEqual(rows, [])
 
 
 if __name__ == "__main__":

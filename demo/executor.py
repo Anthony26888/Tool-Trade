@@ -46,8 +46,8 @@ from .account import (
     balance_after_close,
     gross_pnl,
     net_pnl,
-    position_quantity,
-    position_size,
+    resolve_quantity,
+    slippage_factor,
     total_fee,
     update_peak_equity,
     validate_config,
@@ -115,14 +115,35 @@ class DemoExecutor:
         if existing is not None:
             return DemoPosition.from_row(existing)
         account = self.ensure_account()
-        notional = position_size(account.margin_per_trade, account.leverage)
-        quantity = position_quantity(notional, signal.entry)
+        if account.balance < account.margin_per_trade:
+            logger.warning(
+                "[Demo] cannot open position for signal %s: balance %s below "
+                "margin_per_trade %s",
+                signal.id,
+                account.balance,
+                account.margin_per_trade,
+            )
+            return None
+        # Slippage is execution-time config (not persisted per account row);
+        # bps=0 keeps the historical exact-level fills.
+        entry_exec = Decimal(str(signal.entry)) * slippage_factor(
+            self.config.slippage_bps, direction=signal.direction, entering=True
+        )
+        quantity, rule = resolve_quantity(
+            account.balance,
+            account.margin_per_trade,
+            account.leverage,
+            account.risk_percent,
+            entry_exec,
+            signal.stop_loss,
+        )
+        notional = quantity * entry_exec
         row = self.repository.create_position(
             account_id=account.id,
             signal_id=signal.id,
             symbol=signal.symbol,
             side=signal.direction,
-            entry_price=signal.entry,
+            entry_price=entry_exec,
             quantity=quantity,
             position_size=notional,
             margin=account.margin_per_trade,
@@ -130,7 +151,13 @@ class DemoExecutor:
             stop_loss=signal.stop_loss,
             take_profit=signal.take_profit,
         )
-        logger.info("[Demo] position opened for signal %s (%s %s)", signal.id, signal.direction, signal.symbol)
+        logger.info(
+            "[Demo] position opened for signal %s (%s %s, sized by %s rule)",
+            signal.id,
+            signal.direction,
+            signal.symbol,
+            rule,
+        )
         return DemoPosition.from_row(row)
 
     def close_position(
@@ -164,15 +191,18 @@ class DemoExecutor:
             if signal.close_price is not None
             else position.take_profit if signal.status == STATUS_TP_HIT else position.stop_loss
         )
+        exit_exec = Decimal(str(exit_price)) * slippage_factor(
+            self.config.slippage_bps, direction=signal.direction, entering=False
+        )
         fee_rate = account.fee_rate
         gross = gross_pnl(
-            signal.direction, position.entry_price, exit_price, position.quantity
+            signal.direction, position.entry_price, exit_exec, position.quantity
         )
-        fees = total_fee(position.position_size, exit_price, position.quantity, fee_rate)
+        fees = total_fee(position.position_size, exit_exec, position.quantity, fee_rate)
         net = net_pnl(
             signal.direction,
             position.entry_price,
-            exit_price,
+            exit_exec,
             position.quantity,
             position.position_size,
             fee_rate,
@@ -181,7 +211,7 @@ class DemoExecutor:
             account.balance,
             signal.direction,
             position.entry_price,
-            exit_price,
+            exit_exec,
             position.quantity,
             position.position_size,
             fee_rate,
@@ -196,7 +226,7 @@ class DemoExecutor:
             account_id=account.id,
             side=signal.direction,
             entry_price=position.entry_price,
-            exit_price=exit_price,
+            exit_price=exit_exec,
             quantity=position.quantity,
             margin=position.margin,
             position_size=position.position_size,

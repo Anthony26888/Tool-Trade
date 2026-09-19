@@ -158,7 +158,9 @@ class BacktestStatistics:
                 fees_sum += trade.entry_fee + trade.exit_fee
             if _finite(trade.funding_cost):
                 funding_sum += trade.funding_cost
-            if gross > 0:
+            # A win is net profit after fees/funding (matches live
+            # demo/executor.py): a gross win eaten by costs counts as a loss.
+            if net > 0:
                 gross_profit += gross
                 wins += 1
                 if trade.direction == "LONG":

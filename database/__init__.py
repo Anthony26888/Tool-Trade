@@ -6,8 +6,11 @@ lives here.
 """
 
 from .database import (
+    CANDLE_LOG_RETENTION,
     DECIMAL_COLUMNS,
     DEFAULT_DB_PATH,
+    CandleLogEntry,
+    CandleLogRepository,
     ConfigRepository,
     Database,
     DemoDuplicateError,
@@ -48,11 +51,14 @@ from .models import (
 __all__ = [
     "ACTIVE_STATUSES",
     "ALLOWED_TRANSITIONS",
+    "CANDLE_LOG_RETENTION",
     "DEFAULT_DB_PATH",
     "DECIMAL_COLUMNS",
     "DIRECTIONS",
     "DIRECTION_LONG",
     "DIRECTION_SHORT",
+    "CandleLogEntry",
+    "CandleLogRepository",
     "ConfigRepository",
     "Database",
     "DemoDuplicateError",

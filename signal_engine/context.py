@@ -51,19 +51,23 @@ SNAPSHOT_COLUMNS = (
 )
 
 # Columns shown in the indicator-history table of the rendered context.
+# ``macd_signal`` is snapshot-only: the history keeps the MACD line while the
+# latest signal value stays in the snapshot, halving per-row token cost.
 HISTORY_COLUMNS = (
     "ema20",
     "ema50",
     "ema200",
     "rsi14",
     "macd",
-    "macd_signal",
     "atr14",
     "adx14",
     "volume_ratio",
 )
 
-DEFAULT_MAX_CANDLES = 40
+#: How many most-recent closed candles the LLM is shown. Phase A trimmed this
+#: from 40 to 20 to halve prompt tokens (the full 200+ candle window is still
+#: fetched so EMA200 warms up deterministically).
+DEFAULT_MAX_CANDLES = 20
 _MISSING = "n/a"
 
 
@@ -131,6 +135,9 @@ def build_analysis_context(
     symbol: str = "BTCUSDT",
     timeframe: str = "1h",
     max_candles: int = DEFAULT_MAX_CANDLES,
+    event_note: str | None = None,
+    positioning: str | None = None,
+    htf_note: str | None = None,
 ) -> AnalysisContext:
     """Build the bounded LLM context from closed candles and their indicators.
 
@@ -141,6 +148,13 @@ def build_analysis_context(
         symbol: normalized futures symbol, defaults to ``BTCUSDT``.
         timeframe: candle interval, defaults to ``1h``.
         max_candles: how many most-recent closed candles to show the LLM.
+        event_note: optional Phase N scheduled-event annotation (event candle
+            and/or upcoming release). Appended verbatim as its own section;
+            must reference closed candles only (callers guarantee this).
+        positioning: optional Phase P1 futures-positioning note (funding
+            rate, long/short split, open interest). Appended verbatim.
+        htf_note: optional Phase P2 4H-bias note (regime, structure, ADX).
+            Appended verbatim.
 
     Raises:
         AnalysisContextError: for no/forming/out-of-order candles, insufficient
@@ -231,6 +245,9 @@ def build_analysis_context(
         market_timestamp=market_timestamp,
         closed_at=closed_at,
         last_close=last_close,
+        event_note=event_note,
+        positioning=positioning,
+        htf_note=htf_note,
     )
 
     return AnalysisContext(
@@ -284,6 +301,9 @@ def _render_context(
     market_timestamp: str,
     closed_at: str,
     last_close: float,
+    event_note: str | None = None,
+    positioning: str | None = None,
+    htf_note: str | None = None,
 ) -> str:
     lines = [
         f"# {symbol} — Binance USDT-M Futures",
@@ -328,9 +348,17 @@ def _render_context(
         ),
         "",
         "## Indicator history (most recent first)",
-        "| # | open time (UTC) | ema20, ema50, ema200, rsi14, macd, macd_signal, "
-        "atr14, adx14, volume_ratio |",
+        "| # | open time (UTC) | " + ", ".join(HISTORY_COLUMNS) + " |",
         "|---|-----------------|-----------------------------------------------------------|",
     ]
     lines.append(_render_indicator_rows(indicator_window))
+    note = (event_note or "").strip()
+    if note:
+        lines += ["", "## Scheduled event note", note]
+    pos = (positioning or "").strip()
+    if pos:
+        lines += ["", "## Futures positioning", pos]
+    htf = (htf_note or "").strip()
+    if htf:
+        lines += ["", "## 4H bias", htf]
     return "\n".join(lines)

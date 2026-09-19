@@ -44,11 +44,16 @@ from binance.market_data import Candle
 
 from .analysis import (
     _NO_EXTERNAL_TOOLS,
+    RateLimitedError,
     SignalAnalysis,
     SignalAnalysisError,
     SignalDecision,
     SignalDecisionModel,
     _bind_structured,
+    _extract_usage,
+    _is_rate_limited,
+    _reset_hint,
+    _snapshot_atr,
     _validate_decision_rules,
 )
 from .context import DEFAULT_MAX_CANDLES, AnalysisContext, build_analysis_context
@@ -192,6 +197,26 @@ def _render_step(label: str, model: BaseModel) -> str:
     )
 
 
+def _accumulate_totals(
+    totals: dict[str, int | None] | None,
+    usage: dict[str, int | None] | None,
+) -> dict[str, int | None] | None:
+    """Sum per-step token usage across debate agents (NULL-safe).
+
+    A step without metadata contributes nothing; fields stay NULL unless at
+    least one step reported them.
+    """
+    if not usage:
+        return totals
+    merged = dict(totals or {})
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        value = usage.get(key)
+        if isinstance(value, int) and value >= 0:
+            current = merged.get(key)
+            merged[key] = value if current is None else current + value
+    return merged or None
+
+
 def _analyst_prompt(context: AnalysisContext) -> list[dict[str, str]]:
     return [
         {"role": "system", "content": _ANALYST_SYSTEM},
@@ -323,6 +348,11 @@ class MultiAgentSignalAnalyzer:
         symbol: str = "BTCUSDT",
         timeframe: str = "1h",
         max_candles: int = DEFAULT_MAX_CANDLES,
+        event_note: str | None = None,
+        positioning: str | None = None,
+        funding_rate: float | None = None,
+        htf_note: str | None = None,
+        regime: str | None = None,
     ) -> SignalAnalysis:
         """Run the full committee debate and return a strictly parsed result.
 
@@ -337,30 +367,42 @@ class MultiAgentSignalAnalyzer:
             symbol=symbol,
             timeframe=timeframe,
             max_candles=max_candles,
+            event_note=event_note,
+            positioning=positioning,
+            htf_note=htf_note,
         )
-        analyst = self._step("analyst", AnalystStep, _analyst_prompt(context))
-        bull = self._step("bull", CaseStep, _case_prompt(_BULL_SYSTEM, context, analyst))
-        bear = self._step("bear", CaseStep, _case_prompt(_BEAR_SYSTEM, context, analyst))
-        trader = self._step(
+        analyst, usage = self._step("analyst", AnalystStep, _analyst_prompt(context))
+        calls, totals = 1, _accumulate_totals(None, usage)
+        bull, usage = self._step("bull", CaseStep, _case_prompt(_BULL_SYSTEM, context, analyst))
+        calls, totals = calls + 1, _accumulate_totals(totals, usage)
+        bear, usage = self._step("bear", CaseStep, _case_prompt(_BEAR_SYSTEM, context, analyst))
+        calls, totals = calls + 1, _accumulate_totals(totals, usage)
+        trader, usage = self._step(
             "trader",
             SignalDecisionModel,
             _trader_prompt(context, analyst, bull, bear),
         )
-        risk = self._step(
+        calls, totals = calls + 1, _accumulate_totals(totals, usage)
+        risk, usage = self._step(
             "risk", RiskStep, _risk_prompt(context, analyst, bull, bear, trader)
         )
+        calls, totals = calls + 1, _accumulate_totals(totals, usage)
         decision_model = _validate_decision_rules(risk)
         _validate_ordering(decision_model)
-        return self._to_analysis(context, decision_model, trader, risk)
+        return self._to_analysis(
+            context, decision_model, trader, risk, llm_calls=calls, usage=totals,
+            funding_rate=funding_rate, regime=regime,
+        )
 
     def _step(
         self,
         name: str,
         schema: type[BaseModel],
         prompt: list[dict[str, str]],
-    ) -> BaseModel:
+    ) -> tuple[BaseModel, dict[str, int | None] | None]:
         agent_name = _ROLE_NAMES[name]
         structured = self.structured_llm[name]
+        usage: dict[str, int | None] | None = None
         try:
             if structured is not None:
                 raw = structured.invoke(prompt)
@@ -371,12 +413,18 @@ class MultiAgentSignalAnalyzer:
                     )
             else:
                 response = self.llm.invoke(prompt)
+                usage = _extract_usage(response)
                 raw = getattr(response, "content", response)
         except SignalAnalysisError:
             raise
         except Exception as exc:  # noqa: BLE001 - normalize any LLM error
+            text = str(exc)
+            if _is_rate_limited(text):
+                raise RateLimitedError(
+                    f"{agent_name} LLM rate limit{_reset_hint(text)}: {exc}"
+                ) from exc
             raise SignalAnalysisError(f"{agent_name} LLM analysis failed: {exc}") from exc
-        return _coerce_step(raw, schema, agent_name)
+        return _coerce_step(raw, schema, agent_name), usage
 
     def _to_analysis(
         self,
@@ -384,8 +432,14 @@ class MultiAgentSignalAnalyzer:
         model: SignalDecisionModel,
         trader: SignalDecisionModel,
         risk: RiskStep,
+        *,
+        llm_calls: int = 5,
+        usage: dict[str, int | None] | None = None,
+        funding_rate: float | None = None,
+        regime: str | None = None,
     ) -> SignalAnalysis:
         reasoning = f"{risk.reasoning}\n[Risk note] {risk.risk_note}"
+        usage = usage or {}
         return SignalAnalysis(
             decision=model.decision.value,
             confidence=float(model.confidence),
@@ -404,4 +458,11 @@ class MultiAgentSignalAnalyzer:
             closed_at=context.closed_at,
             candle_close_price=context.last_close,
             temperature=self.config.temperature,
+            atr=_snapshot_atr(context),
+            llm_calls=llm_calls,
+            prompt_tokens=usage.get("prompt_tokens"),
+            completion_tokens=usage.get("completion_tokens"),
+            total_tokens=usage.get("total_tokens"),
+            funding_rate=funding_rate,
+            regime=regime,
         )

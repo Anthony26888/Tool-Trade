@@ -114,7 +114,7 @@ def test_function_provider_wraps_callable():
     hours = make_hours(205)
     analysis = provider.decide(list(hours), None, symbol="BTCUSDT", timeframe="1h")
     assert analysis.decision == "LONG"
-    assert calls == [(205, "BTCUSDT", "1h", 40)]
+    assert calls == [(205, "BTCUSDT", "1h", 20)]
 
 
 def test_replay_provider_missing_key_waits():

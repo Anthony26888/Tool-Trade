@@ -23,6 +23,7 @@ from .analysis import (
     CONFIDENCE_MAX,
     CONFIDENCE_MIN,
     DECISIONS,
+    RateLimitedError,
     SignalAnalysis,
     SignalAnalysisError,
     SignalAnalyzer,
@@ -49,8 +50,10 @@ from .context import (
 )
 from .engine import SignalEngine, SignalEngineResult, SignalOutcome
 from .llm import (
+    DEFAULT_MAX_RETRIES as LLM_DEFAULT_MAX_RETRIES,
     DEFAULT_MODEL,
     DEFAULT_PROVIDER,
+    DEFAULT_TIMEOUT_SECONDS as LLM_DEFAULT_TIMEOUT_SECONDS,
     ENV_LLM_BASE_URL,
     ENV_LLM_MAX_RETRIES,
     ENV_LLM_MAX_TOKENS,
@@ -61,6 +64,8 @@ from .llm import (
     KNOWN_MODEL_KEYS,
     PROVIDER_DEFAULT_MODEL,
     SIGNAL_MODELS,
+    TEMPERATURE_MAX as LLM_TEMPERATURE_MAX,
+    TEMPERATURE_MIN as LLM_TEMPERATURE_MIN,
     LLMConfig,
     LLMConfigError,
     ModelSpec,
@@ -129,11 +134,14 @@ from .telegram import (
     validate_telegram_config,
 )
 from .validator import (
+    GuardrailConfig,
     SignalCandidate,
+    default_guardrails,
     to_price,
     validate_analysis,
     validate_confidence,
     validate_decision,
+    validate_trade_levels,
 )
 
 __all__ = [
@@ -153,6 +161,7 @@ __all__ = [
     "mask_secret",
     "SignalAnalysis",
     "SignalAnalysisError",
+    "RateLimitedError",
     "SignalAnalyzer",
     "SignalCandidate",
     "SignalDecision",
@@ -191,8 +200,15 @@ __all__ = [
     "validate_analysis",
     "validate_confidence",
     "validate_decision",
+    "validate_trade_levels",
+    "GuardrailConfig",
+    "default_guardrails",
     "DEFAULT_MODEL",
     "DEFAULT_PROVIDER",
+    "LLM_DEFAULT_MAX_RETRIES",
+    "LLM_DEFAULT_TIMEOUT_SECONDS",
+    "LLM_TEMPERATURE_MAX",
+    "LLM_TEMPERATURE_MIN",
     "DEFAULT_CANDLE_LIMIT",
     "DEFAULT_BACKOFF_SECONDS",
     "DEFAULT_MAX_RETRIES",

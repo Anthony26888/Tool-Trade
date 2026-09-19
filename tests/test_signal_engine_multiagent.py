@@ -26,6 +26,7 @@ from signal_engine import (
     LLMConfig,
     MultiAgentSignalAnalyzer,
     OneHourScheduler,
+    RateLimitedError,
     SchedulerOutcome,
     SignalAnalysis,
     SignalAnalysisError,
@@ -307,6 +308,25 @@ class TestMultiAgentAnalyzer(unittest.TestCase):
         by_role["trader"].invoke.assert_not_called()
         by_role["risk"].invoke.assert_not_called()
 
+    def test_agent_rate_limit_is_classified(self):
+        results = _long_results()
+        results["bull"] = RuntimeError("Error code: 429, rate limit exceeded")
+        llm, _ = _make_llm(results)
+        with self.assertRaises(RateLimitedError):
+            MultiAgentSignalAnalyzer(CONFIG, llm=llm).analyze(
+                self.candles, self.indicators
+            )
+
+    def test_full_debate_counts_five_calls(self):
+        llm, _ = _make_llm(_long_results())
+        analysis = MultiAgentSignalAnalyzer(CONFIG, llm=llm).analyze(
+            self.candles, self.indicators
+        )
+        self.assertEqual(analysis.llm_calls, 5)
+        # Structured path drops the envelope: token counts stay NULL.
+        self.assertIsNone(analysis.prompt_tokens)
+        self.assertIsNone(analysis.total_tokens)
+
     def test_structured_fallback_parses_strict_json(self):
         payloads = [
             json.dumps(_analyst_payload()),
@@ -407,6 +427,9 @@ class TestResolveAnalysisMode(unittest.TestCase):
 @pytest.mark.unit
 class TestMultiAgentThroughScheduler(unittest.TestCase):
     def test_multi_agent_persists_pending_entry(self):
+        # ATR snapshot neutralized on purpose: the canned levels are
+        # real-market scale while the synthetic candles have tiny volatility;
+        # ATR-bound logic gets dedicated validator unit tests.
         harness = TempSignalDb()
         self.addCleanup(harness.close)
         candles = make_candles(DEFAULT_WINDOW_CANDLES)
@@ -414,9 +437,12 @@ class TestMultiAgentThroughScheduler(unittest.TestCase):
         llm, _ = _make_llm(_long_results())
 
         def analyzer(c, i):
-            return MultiAgentSignalAnalyzer(CONFIG, llm=llm).analyze(
-                c, i, symbol="BTCUSDT", timeframe="1h"
-            )
+            with patch(
+                "signal_engine.multiagent._snapshot_atr", return_value=None
+            ):
+                return MultiAgentSignalAnalyzer(CONFIG, llm=llm).analyze(
+                    c, i, symbol="BTCUSDT", timeframe="1h"
+                )
 
         sched = OneHourScheduler(
             harness.repository,

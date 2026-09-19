@@ -128,6 +128,24 @@ class TestBuildAnalysisContext(unittest.TestCase):
         self.assertEqual(len(context.candles), 40)
         self.assertEqual(len(context.indicators), 40)
 
+    def test_default_max_candles_is_trimmed_for_token_budget(self):
+        # Phase A: the default look-back is 20 candles (not 40) so each LLM
+        # call costs roughly half the prompt tokens.
+        candles = make_candles(240)
+        context = build_analysis_context(candles, indicators_for(candles))
+        self.assertEqual(context.max_candles, 20)
+        self.assertEqual(len(context.candles), 20)
+        self.assertEqual(len(context.indicators), 20)
+
+    def test_history_table_omits_macd_signal(self):
+        # The history table drops macd_signal (snapshot keeps MACD/signal/
+        # histogram); the snapshot must still carry the signal line.
+        candles = make_candles(240)
+        context = build_analysis_context(candles, indicators_for(candles))
+        snapshot, history = context.rendered.split("## Indicator history")
+        self.assertIn("signal=", snapshot)
+        self.assertNotIn("macd_signal", history)
+
     def test_max_candles_clamped_to_total(self):
         candles = make_candles(240)
         context = build_analysis_context(

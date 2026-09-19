@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
-from backtest.config import BacktestConfig, BacktestConfigError
+from backtest.config import BacktestConfig, BacktestConfigError, interval_to_ms
 from backtest.data import HistoricalData
 from backtest.engine import BacktestEngine, BacktestResult
 from backtest.export import export_result_json, export_trades_csv
@@ -66,6 +66,7 @@ def build_llm_decision_provider(
     context_version: int = CONTEXT_VERSION,
     dataset_id: str | None = None,
     force_fresh: bool = False,
+    analyze_fn: Any = None,
 ):  # pragma: no cover - import indirection for testability
     """Build the real LLM-backed provider for one benchmark run.
 
@@ -82,6 +83,7 @@ def build_llm_decision_provider(
         context_version=context_version,
         dataset_id=dataset_id,
         force_fresh=force_fresh,
+        analyze_fn=analyze_fn,
     )
 
 
@@ -97,6 +99,139 @@ def verify_llm_temperature(llm_config: LLMConfig) -> None:
         )
 
 
+def build_positioning_wiring(
+    *,
+    history: Any,
+    period_ms: int,
+    analyze_base: Any,
+) -> tuple[Any, list]:
+    """Phase P1 benchmark wiring for a primed ``PositioningHistory``.
+
+    Returns ``(analyze_fn, frozen)``: the analyzer wrapper threading the
+    historical positioning note + funding rate into each decision (same
+    prompt shape and guardrail input as live), and the JSON snapshot for
+    ``positioning.json``. Accepts and forwards ``event_note``/``htf_note``/
+    ``regime`` so it composes with the other wirings.
+    """
+
+    def _pos_analyze(
+        candles: list,
+        indicators: Any,
+        *,
+        symbol: str = "BTCUSDT",
+        timeframe: str = "1h",
+        max_candles: int = 20,
+        event_note: str | None = None,
+        htf_note: str | None = None,
+        regime: str | None = None,
+    ) -> Any:
+        now_ms = int(candles[-1].timestamp) + period_ms
+        return analyze_base(
+            candles,
+            indicators,
+            symbol=symbol,
+            timeframe=timeframe,
+            max_candles=max_candles,
+            event_note=event_note,
+            positioning=history.note_at(now_ms),
+            funding_rate=history.funding_at(now_ms),
+            htf_note=htf_note,
+            regime=regime,
+        )
+
+    return _pos_analyze, history.frozen()
+
+
+def build_htf_wiring(*, analyze_base: Any) -> Any:
+    """Phase P2 benchmark wiring: 4H bias rolled up from the 1H dataset.
+
+    Rolls the decision window's 1H candles into 4H candles with the same
+    ``rollup_1h_to_4h`` the live path's data already satisfies, classifies
+    with the same ``classify_htf``, and threads the note + regime inward.
+    Accepts and forwards the outer wirings' notes (innermost wrapper).
+    """
+    from binance.htf import REGIME_NONE, classify_htf, rollup_1h_to_4h
+
+    def _htf_analyze(
+        candles: list,
+        indicators: Any,
+        *,
+        symbol: str = "BTCUSDT",
+        timeframe: str = "1h",
+        max_candles: int = 20,
+        event_note: str | None = None,
+        positioning: str | None = None,
+        funding_rate: float | None = None,
+    ) -> Any:
+        try:
+            bias = classify_htf(rollup_1h_to_4h(list(candles)))
+        except Exception:
+            bias = None
+        regime = (
+            bias.regime
+            if bias is not None and bias.regime != REGIME_NONE
+            else None
+        )
+        return analyze_base(
+            candles,
+            indicators,
+            symbol=symbol,
+            timeframe=timeframe,
+            max_candles=max_candles,
+            event_note=event_note,
+            positioning=positioning,
+            funding_rate=funding_rate,
+            htf_note=bias.note if bias is not None else None,
+            regime=regime,
+        )
+
+    return _htf_analyze
+
+
+def build_event_wiring(    *,
+    event_calendar: Any,
+    hours: list,
+    period_ms: int,
+    analyze_base: Any,
+) -> tuple[Any, Any, list]:
+    """Phase N benchmark wiring for a primed ``EventCalendar``.
+
+    Loads the historical range, freezes it for deterministic replay, and
+    returns ``(blackout_fn, analyze_fn, frozen_events)``: the backtest gate,
+    the event-note analyzer wrapper, and the JSON snapshot for ``events.json``.
+    """
+    event_calendar.load_range(
+        int(hours[0].timestamp), int(hours[-1].timestamp) + period_ms
+    )
+    frozen = event_calendar.frozen()
+
+    def _blackout(decision_ms: int) -> str | None:
+        event = event_calendar.blackout_at(decision_ms)
+        return event.title if event is not None else None
+
+    def _noted_analyze(
+        candles: list,
+        indicators: Any,
+        *,
+        symbol: str = "BTCUSDT",
+        timeframe: str = "1h",
+        max_candles: int = 20,
+    ) -> Any:
+        note = event_calendar.event_note(
+            candles, int(candles[-1].timestamp) + period_ms
+        )
+        return analyze_base(
+            candles,
+            indicators,
+            symbol=symbol,
+            timeframe=timeframe,
+            max_candles=max_candles,
+            event_note=note,
+        )
+
+    return _blackout, _noted_analyze, frozen
+
+
 def run_benchmark(
     *,
     config: BacktestConfig,
@@ -106,8 +241,18 @@ def run_benchmark(
     context_version: int = CONTEXT_VERSION,
     dataset_id: str | None = None,
     force_fresh: bool = False,
+    event_calendar: Any = None,
+    positioning: Any = None,
+    htf: bool = False,
 ) -> RunSummary:
     """Run one model benchmark over one dataset and export its artifacts.
+
+    ``event_calendar`` (Phase N, optional) is a dedicated
+    :class:`signal_engine.event_calendar.EventCalendar`: its historical range
+    is loaded for the dataset span, frozen to ``events.json`` for a
+    deterministic replay, candles whose decision time falls in a blackout are
+    skipped like the live gate, and analyzed candles carry the same event
+    annotation the live prompt would show.
 
     Raises:
         BenchmarkError: for invalid benchmark configuration or a failed run.
@@ -125,18 +270,57 @@ def run_benchmark(
         cache.load()
 
     start = time.perf_counter()
-    provider = build_llm_decision_provider(
-        llm_config=llm,
-        cache=cache,
-        context_version=context_version,
-        dataset_id=dataset_id,
-        force_fresh=force_fresh,
-    )
+    blackout_fn = None
+    analyze_fn = None
+    if event_calendar is not None or positioning is not None or htf:
+        from signal_engine.analysis import SignalAnalyzer
+
+        analyze_base = SignalAnalyzer(llm).analyze
+        period_ms = interval_to_ms(config.timeframe)
+        if htf:
+            # Innermost wrapper: computes the 4H bias from the window and
+            # accepts the outer wirings' notes.
+            analyze_base = build_htf_wiring(analyze_base=analyze_base)
+        if positioning is not None:
+            # Inner wrapper (closest to the analyzer): threads the funding
+            # note + rate and forwards any outer event_note.
+            analyze_base, frozen_pos = build_positioning_wiring(
+                history=positioning,
+                period_ms=period_ms,
+                analyze_base=analyze_base,
+            )
+            pos_path = os.path.join(out, "positioning.json")
+            with open(pos_path, "w", encoding="utf-8") as handle:
+                json.dump(frozen_pos, handle, indent=2)
+                handle.write("\n")
+        if event_calendar is not None:
+            blackout_fn, analyze_fn, frozen_events = build_event_wiring(
+                event_calendar=event_calendar,
+                hours=list(data.hour_candles),
+                period_ms=period_ms,
+                analyze_base=analyze_base,
+            )
+            events_path = os.path.join(out, "events.json")
+            with open(events_path, "w", encoding="utf-8") as handle:
+                json.dump(frozen_events, handle, indent=2)
+                handle.write("\n")
+        else:
+            analyze_fn = analyze_base if positioning is not None else None
+    provider_kwargs: dict[str, Any] = {
+        "llm_config": llm,
+        "cache": cache,
+        "context_version": context_version,
+        "dataset_id": dataset_id,
+        "force_fresh": force_fresh,
+    }
+    if analyze_fn is not None:
+        provider_kwargs["analyze_fn"] = analyze_fn
+    provider = build_llm_decision_provider(**provider_kwargs)
     load_time = time.perf_counter() - start
     provider.stats.set_load_time(load_time)
 
     try:
-        result = BacktestEngine(config, data, provider).run()
+        result = BacktestEngine(config, data, provider, blackout=blackout_fn).run()
     except Exception as exc:
         raise BenchmarkError(f"benchmark engine failed: {exc}") from exc
 
@@ -175,6 +359,12 @@ def run_benchmark(
     )
 
     files = _write_artifacts(result, statistics, out, decisions_path)
+    events_path = os.path.join(out, "events.json")
+    if os.path.exists(events_path):
+        files["events"] = events_path
+    pos_path = os.path.join(out, "positioning.json")
+    if os.path.exists(pos_path):
+        files["positioning"] = pos_path
     summary["files"] = files
     with open(os.path.join(out, "summary.json"), "w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)

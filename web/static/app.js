@@ -64,20 +64,41 @@ function emptyBox(text) {
 
 // -- navigation ---------------------------------------------------------------
 
-const PANELS = ["dashboard", "signals", "trades", "statistics", "settings"];
+const PANELS = ["dashboard", "signals", "daemon", "events", "trades", "statistics", "settings"];
+const TITLES = { dashboard: ["Dashboard", "Signal & demo trading overview"], signals: ["Signals", "AI signal ledger"], daemon: ["Daemon Log", "Per-1H-candle AI activity"], events: ["Events", "Macro calendar — trading pauses inside ⏸ windows"], trades: ["Trades", "Demo trade ledger"], statistics: ["Statistics", "Performance metrics"], settings: ["Settings", "AI provider, demo account & notifications"] };
 let current = "dashboard";
 
+let loadSeq = 0;
+
+function showLoader() {
+  const el = $("#loading");
+  if (el) el.classList.remove("hidden");
+}
+
+function hideLoader() {
+  const el = $("#loading");
+  if (el) el.classList.add("hidden");
+}
+
+function showPanel(name) {
+  current = name;
+  document.querySelectorAll(".nav-item").forEach((b) => b.classList.toggle("active", b.dataset.panel === name));
+  document.querySelectorAll(".panel").forEach((p) => p.classList.toggle("active", p.id === "panel-" + name));
+  const gear = document.getElementById("settingsGear");
+  if (gear) gear.classList.toggle("active", name === "settings");
+  $("#pageTitle").textContent = TITLES[name][0];
+  $("#pageSub").textContent = TITLES[name][1];
+  const seq = ++loadSeq;
+  showLoader();
+  refresh(name).then(() => { if (seq === loadSeq) hideLoader(); });
+}
+
 document.querySelectorAll(".nav-item").forEach((btn) => {
-  btn.addEventListener("click", () => {
-    current = btn.dataset.panel;
-    document.querySelectorAll(".nav-item").forEach((b) => b.classList.toggle("active", b === btn));
-    document.querySelectorAll(".panel").forEach((p) => p.classList.toggle("active", p.id === "panel-" + current));
-    const titles = { dashboard: ["Dashboard", "Signal & demo trading overview"], signals: ["Signals", "AI signal ledger"], trades: ["Trades", "Demo trade ledger"], statistics: ["Statistics", "Performance metrics"], settings: ["Settings", "AI provider, demo account & notifications"] };
-    $("#pageTitle").textContent = titles[current][0];
-    $("#pageSub").textContent = titles[current][1];
-    refresh(current);
-  });
+  btn.addEventListener("click", () => showPanel(btn.dataset.panel));
 });
+
+$("#settingsGear").addEventListener("click", () => showPanel("settings"));
+$("#eventsBtn").addEventListener("click", () => showPanel("events"));
 
 // -- dashboard ----------------------------------------------------------------
 
@@ -400,11 +421,42 @@ async function loadChart() {
     }
     if (candles.length) parts.push("last $" + fmtNum(candles[candles.length - 1].c, 2));
     $("#chartLegend").innerHTML = '<span class="muted">' + parts.join("  ·  ") + '</span>';
+    loadPositioning().catch(() => {});
   } catch (err) {
     $("#chartMsg").textContent = "Chart data unavailable — " + err.message;
     lastChart = null;
     $("#chartLive").textContent = "";
   }
+}
+
+// -- futures positioning bar (Phase P1, under the chart) ----------------------
+
+async function loadPositioning() {
+  const el = $("#lsBar");
+  if (!el) return;
+  let data;
+  try {
+    data = await api("/api/positioning");
+  } catch (_) {
+    el.innerHTML = '<span class="muted">Positioning unavailable</span>';
+    return;
+  }
+  const fundOf = (d) => (d.funding_rate !== null && d.funding_rate !== undefined)
+    ? ` · Funding ${d.funding_rate >= 0 ? "+" : ""}${fmtNum(d.funding_rate * 100, 3)}%/8h` : "";
+  if (!data || !data.available || !(data.long_pct > 0)) {
+    el.innerHTML = `<span class="muted">Long/Short unavailable${data ? fundOf(data) : ""}</span>`;
+    return;
+  }
+  const long = Number(data.long_pct);
+  const short = 100 - long;
+  const oi = (data.open_interest !== null && data.open_interest !== undefined)
+    ? ` · OI ${fmtNum(data.open_interest, 1)} BTC` : "";
+  el.innerHTML =
+    `<div class="ls-track"><div class="ls-long" style="width:${long.toFixed(1)}%"></div>` +
+    `<div class="ls-short" style="width:${short.toFixed(1)}%"></div></div>` +
+    `<div class="ls-label"><span class="ls-long-t">Long ${long.toFixed(1)}%</span>` +
+    `<span class="muted">${escapeHtml(data.symbol || "")}${fundOf(data)}${oi}</span>` +
+    `<span class="ls-short-t">Short ${short.toFixed(1)}%</span></div>`;
 }
 
 // -- signal chat (read-only Q&A drawer) ----------------------------------------
@@ -546,19 +598,88 @@ function renderSignalTable(list) {
   if (!list.length) return emptyBox("No signals recorded yet.");
   const head = `<tr><th></th><th>ID</th><th>Direction</th><th>Entry</th><th>TP</th><th>SL</th><th>Conf</th><th>Status</th><th>Result</th><th>Model</th><th>Time</th></tr>`;
   const body = list.map((s) => `<tr>
-    <td><input type="checkbox" class="sig-check" data-id="${s.id}"></td>
-    <td>${s.id}</td>
-    <td>${badge(s.direction)}</td>
-    <td>$${fmtNum(s.entry, 2)}</td>
-    <td>$${fmtNum(s.take_profit, 2)}</td>
-    <td>$${fmtNum(s.stop_loss, 2)}</td>
-    <td>${fmtNum(s.confidence, 0)}</td>
-    <td>${badge(s.status)}</td>
-    <td>${s.result ? badge(s.result) : "—"}</td>
-    <td>${s.model_name}</td>
-    <td>${fmtVn(s.created_at)}</td>
+    <td class="sig-checkbox-cell"><input type="checkbox" class="sig-check" data-id="${s.id}"></td>
+    <td data-label="ID">${s.id}</td>
+    <td data-label="Direction">${badge(s.direction)}</td>
+    <td data-label="Entry">$${fmtNum(s.entry, 2)}</td>
+    <td data-label="TP">$${fmtNum(s.take_profit, 2)}</td>
+    <td data-label="SL">$${fmtNum(s.stop_loss, 2)}</td>
+    <td data-label="Conf">${fmtNum(s.confidence, 0)}</td>
+    <td data-label="Status">${badge(s.status)}</td>
+    <td data-label="Result">${s.result ? badge(s.result) : "—"}</td>
+    <td data-label="Model">${s.model_name}</td>
+    <td data-label="Time">${fmtVn(s.created_at)}</td>
   </tr>`).join("");
   return `<table><thead>${head}</thead><tbody>${body}</tbody></table>`;
+}
+
+function daemonTimeRange() {
+  const v = $("#ddTime").value;
+  if (!v) return null;
+  return sigTimeRange(); // same "today/7d/30d" boundaries as the signals tab
+}
+
+function renderDaemonTable(list) {
+  if (!list.length) return emptyBox("No daemon activity recorded yet. The daemon writes one row per closed 1H candle once it runs.");
+  const head = `<tr><th>Recorded</th><th>Candle close (VN)</th><th>Decision</th><th>Conf</th><th>Outcome</th><th>Signal</th><th>Model</th><th>Close</th><th>Calls</th><th>Error / Notes</th></tr>`;
+  const body = list.map((e) => {
+    const decision = e.decision ? badge(e.decision) : "—";
+    const outcomeCls = String(e.outcome || "").toLowerCase();
+    const outcome = `<span class="badge ${outcomeCls.replace("_", "-")}">${e.outcome || ""}</span>`;
+    const sig = e.signal_id
+      ? `<button type="button" class="btn-link sig-link" data-id="${e.signal_id}">#${e.signal_id}</button>`
+      : "—";
+    const notes = (e.error_notes || "") ? `<span class="note-cell">${escapeHtml(truncate(e.error_notes, 60))}</span>` : "—";
+    const res = `$${fmtNum(e.close_price, 2)}`;
+    const calls = (e.llm_calls === null || e.llm_calls === undefined) ? "—" : e.llm_calls;
+    const tokens = [e.prompt_tokens, e.completion_tokens, e.total_tokens].every((v) => v === null || v === undefined)
+      ? ""
+      : `<div class="kv"><span>tokens in / out / total</span><span>${e.prompt_tokens ?? "—"} / ${e.completion_tokens ?? "—"} / ${e.total_tokens ?? "—"}</span></div>`;
+    return `<tr class="dd-row" data-row="${e.id}">
+      <td data-label="Recorded">${fmtVn(e.recorded_at)}</td>
+      <td data-label="Candle close (VN)">${fmtVnMs(e.candle_timestamp_ms)}</td>
+      <td data-label="Decision">${decision}</td>
+      <td data-label="Conf">${fmtNum(e.confidence, 0)}</td>
+      <td data-label="Outcome">${outcome}</td>
+      <td data-label="Signal">${sig}</td>
+      <td data-label="Model">${escapeHtml(e.model || e.provider || "—")}</td>
+      <td data-label="Close">${res}</td>
+      <td data-label="Calls">${calls}</td>
+      <td data-label="Error/Notes">${notes}</td>
+    </tr>
+    <tr class="dd-detail" id="dd-detail-${e.id}" hidden><td colspan="10">
+      <div class="dd-detail-box">
+        <div class="kv"><span>entry / SL / TP</span><span>$${fmtNum(e.entry, 2)} / $${fmtNum(e.stop_loss, 2)} / $${fmtNum(e.take_profit, 2)}</span></div>
+        <div class="kv"><span>LLM calls</span><span>${calls}</span></div>
+        ${tokens}
+        ${Object.entries(e.indicators || {}).map(([k, val]) => `<span class="indc">${k}=${fmtNum(val, 4)}</span>`).join("")}
+        ${e.reasoning ? `<div class="dd-reason">${escapeHtml(e.reasoning)}</div>` : ""}
+        ${e.error_notes ? `<div class="dd-reason err">${escapeHtml(e.error_notes)}</div>` : ""}
+      </div>
+    </td></tr>`;
+  }).join("");
+  return `<table><thead>${head}</thead><tbody>${body}</tbody></table>`;
+}
+
+function truncate(text, n) {
+  return String(text).length > n ? String(text).slice(0, n) + "…" : String(text);
+}
+
+async function loadDaemonLog() {
+  const p = new URLSearchParams({ limit: "500" });
+  const dir = $("#ddDir").value;
+  const range = daemonTimeRange();
+  if (dir) p.set("decision", dir);
+  if (range) p.set("since", range.since);
+  const data = await api("/api/daemon-log?" + p.toString());
+  $("#daemonTable").innerHTML = renderDaemonTable(data.rows || []);
+}
+
+async function clearDaemonLog() {
+  if (!confirm("Delete the entire daemon activity log? This only removes diagnostic rows, not signals/positions.")) return;
+  const res = await api("/api/daemon-log", { method: "DELETE" });
+  toast("Cleared " + (res.cleared || 0) + " log row(s)", "ok");
+  loadDaemonLog().catch((e) => toast(e.message, "error"));
 }
 
 async function loadSignals() {
@@ -599,16 +720,16 @@ async function loadTrades() {
   if (!list.length) { $("#tradesTable").innerHTML = emptyBox("No demo trades closed yet."); return; }
   const head = `<tr><th>ID</th><th>Side</th><th>Entry</th><th>Exit</th><th>Qty</th><th>Gross</th><th>Fee</th><th>Net PnL</th><th>Result</th><th>Closed</th></tr>`;
   const body = list.map((t) => `<tr>
-    <td>${t.id}</td>
-    <td>${badge(t.side)}</td>
-    <td>$${fmtNum(t.entry_price, 2)}</td>
-    <td>$${fmtNum(t.exit_price, 2)}</td>
-    <td>${fmtNum(t.quantity, 6)}</td>
-    <td>$${fmtNum(t.gross_pnl, 2)}</td>
-    <td>$${fmtNum(t.fee, 4)}</td>
-    <td style="color:${Number(t.net_pnl) >= 0 ? "var(--green)" : "var(--red)"}">$${fmtNum(t.net_pnl, 2)}</td>
-    <td>${badge(t.result)}</td>
-    <td>${fmtVn(t.closed_at)}</td>
+    <td data-label="ID">${t.id}</td>
+    <td data-label="Side">${badge(t.side)}</td>
+    <td data-label="Entry">$${fmtNum(t.entry_price, 2)}</td>
+    <td data-label="Exit">$${fmtNum(t.exit_price, 2)}</td>
+    <td data-label="Qty">${fmtNum(t.quantity, 6)}</td>
+    <td data-label="Gross">$${fmtNum(t.gross_pnl, 2)}</td>
+    <td data-label="Fee">$${fmtNum(t.fee, 4)}</td>
+    <td data-label="Net PnL" style="color:${Number(t.net_pnl) >= 0 ? "var(--green)" : "var(--red)"}">$${fmtNum(t.net_pnl, 2)}</td>
+    <td data-label="Result">${badge(t.result)}</td>
+    <td data-label="Closed">${fmtVn(t.closed_at)}</td>
   </tr>`).join("");
   $("#tradesTable").innerHTML = `<table><thead>${head}</thead><tbody>${body}</tbody></table>`;
 }
@@ -819,19 +940,22 @@ function renderTelegramForm(t) {
     <div class="radio-row">
       <label><input type="checkbox" id="tgEnabled" ${t.enabled ? "checked" : ""} /> Enabled</label>
     </div>
-    <div class="field"><label>Chat ID</label><input type="text" id="tgChat" value="${escapeHtml(t.chat_id_masked === "********" ? "" : t.chat_id_masked)}" placeholder="e.g. 123456789" />${t.chat_id_configured ? `<span class="hint">configured (masked)</span>` : ""}</div>
+    <div class="field"><label>Chat ID — Signals (vòng đời lệnh)</label><input type="text" id="tgChatSignals" value="" placeholder="e.g. -100111222333" />${t.chat_id_signals_configured ? `<span class="hint">configured (masked)</span>` : ""}</div>
+    <div class="field"><label>Chat ID — Reports (báo cáo + thông báo)</label><input type="text" id="tgChatReports" value="" placeholder="e.g. -100444555666" />${t.chat_id_reports_configured ? `<span class="hint">configured (masked)</span>` : ""}</div>
     <div class="field"><label>Bot Token</label><input type="password" id="tgToken" autocomplete="off" placeholder="${t.token_configured ? "configured: " + (t.token_masked || "••••") : "not configured"}" /></div>
-    <div class="hint">Tokens and chat ids are stored encrypted-side (0600 secrets file); the UI always masks them.</div>
+    <div class="hint">Một bot, hai group: add bot vào cả 2 group rồi dán chat id. Bỏ trống một kênh = tin dồn về kênh còn lại. Tokens and chat ids are stored encrypted-side (0600 secrets file); the UI always masks them.</div>
     <div class="row2">
       <button type="button" class="btn" id="saveTelegram">Save Telegram</button>
-      <button type="button" class="btn secondary" id="testTelegram">Send Test</button>
+      <button type="button" class="btn secondary" id="testTelegramSignals">Test Signals</button>
+      <button type="button" class="btn secondary" id="testTelegramReports">Test Reports</button>
     </div>`;
   $("#telegramForm").innerHTML = fields;
   $("#saveTelegram").addEventListener("click", async () => {
     try {
       const body = {
         enabled: $("#tgEnabled").checked,
-        chat_id: $("#tgChat").value.trim(),
+        chat_id_signals: $("#tgChatSignals").value.trim(),
+        chat_id_reports: $("#tgChatReports").value.trim(),
         bot_token: $("#tgToken").value.trim(),
       };
       const result = await api("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ telegram: body }) });
@@ -841,12 +965,14 @@ function renderTelegramForm(t) {
       toast("Telegram save failed: " + err.message, "error");
     }
   });
-  $("#testTelegram").addEventListener("click", async () => {
+  const sendTest = async (channel) => {
     try {
-      const r = await api("/api/settings/test-telegram", { method: "POST" });
-      toast(r.result.success ? "Test message sent ✓" : "Test failed: " + r.result.error, r.result.success ? "" : "error");
+      const r = await api("/api/settings/test-telegram", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ channel }) });
+      toast(r.result.success ? `Test to ${channel} sent ✓` : "Test failed: " + r.result.error, r.result.success ? "" : "error");
     } catch (err) { toast("Test failed: " + err.message, "error"); }
-  });
+  };
+  $("#testTelegramSignals").addEventListener("click", () => sendTest("signals"));
+  $("#testTelegramReports").addEventListener("click", () => sendTest("reports"));
 }
 
 function renderSymbolForm(sym) {
@@ -900,29 +1026,181 @@ function renderAudit(audit) {
   }
   const head = `<tr><th>Time</th><th>Namespace</th><th>Action</th><th>Summary</th></tr>`;
   const body = list.map((a) => `<tr>
-    <td>${fmtVn(a.created_at)}</td>
-    <td>${escapeHtml(a.namespace)}</td>
-    <td>${escapeHtml(a.action)}</td>
-    <td class="audit-summary">${escapeHtml(a.summary)}</td>
+    <td data-label="Time">${fmtVn(a.created_at)}</td>
+    <td data-label="Namespace">${escapeHtml(a.namespace)}</td>
+    <td data-label="Action">${escapeHtml(a.action)}</td>
+    <td data-label="Summary" class="audit-summary">${escapeHtml(a.summary)}</td>
   </tr>`).join("");
   $("#auditBox").innerHTML = `<table><thead>${head}</thead><tbody>${body}</tbody></table>`;
 }
 
+// -- macro events (banner + calendar tab) --------------------------------------
+
+async function loadEventBanner() {
+  const el = $("#eventBanner");
+  if (!el) return;
+  let data;
+  try {
+    data = await api("/api/events");
+  } catch (_) {
+    el.hidden = true;
+    return;
+  }
+  const active = data && data.active;
+  const upcoming = (data && data.upcoming) || [];
+  if (active) {
+    el.hidden = false;
+    el.className = "event-banner active";
+    el.title = (active.title || "") + " — " + (active.event_utc || "");
+    el.textContent = `⏸ BLACKOUT: ${active.title} — AI nghỉ đến ${active.blackout_end_vn}`;
+    return;
+  }
+  const next = upcoming.find((e) => e && e.event_ms && e.event_ms > Date.now());
+  if (next && next.event_ms - Date.now() <= 24 * 3600 * 1000) {
+    const mins = Math.max(1, Math.round((next.event_ms - Date.now()) / 60000));
+    const when = mins >= 90 ? `sau ~${Math.round(mins / 60)}h` : `sau ${mins}p`;
+    el.hidden = false;
+    el.className = "event-banner upcoming";
+    el.title = (next.title || "") + " — " + (next.event_utc || "");
+    el.textContent = `⚠️ ${next.title} ${when} — ngừng mở lệnh từ ${next.blackout_start_vn}`;
+    return;
+  }
+  el.hidden = true;
+}
+
+$("#eventBanner").addEventListener("click", () => showPanel("events"));
+
+let eventsMonth = null; // "YYYY-MM", null = current month
+let eventsDays = {};
+
+const VN_MONTHS = ["Tháng 1", "Tháng 2", "Tháng 3", "Tháng 4", "Tháng 5", "Tháng 6", "Tháng 7", "Tháng 8", "Tháng 9", "Tháng 10", "Tháng 11", "Tháng 12"];
+
+function shiftMonth(key, delta) {
+  const [y, m] = key.split("-").map(Number);
+  const d = new Date(y, m - 1 + delta, 1);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}`;
+}
+
+async function loadEvents() {
+  if (!eventsMonth) {
+    const now = new Date();
+    const p = (n) => String(n).padStart(2, "0");
+    eventsMonth = `${now.getFullYear()}-${p(now.getMonth() + 1)}`;
+  }
+  const data = await api("/api/events/calendar?month=" + encodeURIComponent(eventsMonth));
+  eventsMonth = data.month || eventsMonth;
+  eventsDays = (data && data.days) || {};
+  renderEventsCalendar();
+}
+
+function renderEventsCalendar() {
+  const grid = $("#calGrid");
+  if (!grid) return;
+  const [y, m] = eventsMonth.split("-").map(Number);
+  $("#calMonth").textContent = `${VN_MONTHS[m - 1]} · ${y}`;
+  const first = new Date(y, m - 1, 1);
+  const lead = (first.getDay() + 6) % 7; // Monday-first
+  const dim = new Date(y, m, 0).getDate();
+  const dimPrev = new Date(y, m - 1, 0).getDate();
+  const today = new Date();
+  const todayKey = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+  const cells = [];
+  for (let i = 0; i < lead; i++) {
+    cells.push(`<span class="cal-day dim">${dimPrev - lead + 1 + i}</span>`);
+  }
+  for (let d = 1; d <= dim; d++) {
+    const key = `${eventsMonth}-${String(d).padStart(2, "0")}`;
+    const list = eventsDays[key] || [];
+    const chips = list.slice(0, 2).map((e) => {
+      const imp = String(e.impact || "").toLowerCase() === "high" ? "imp-high" : (String(e.impact || "").toLowerCase() === "medium" ? "imp-medium" : "imp-low");
+      const mark = e.trading_paused ? "⏸ " : "";
+      const paused = e.trading_paused ? " paused" : "";
+      return `<span class="cal-chip ${imp}${paused}">${mark}${escapeHtml(String(e.name || "?"))}</span>`;
+    }).join("");
+    const more = list.length > 2 ? `<span class="cal-more">+${list.length - 2}</span>` : "";
+    const dayPaused = list.some((e) => e.trading_paused);
+    const cls = "cal-day" + (key === todayKey ? " today" : "") + (dayPaused ? " paused" : (list.length ? " has-event" : ""));
+    cells.push(`<button type="button" class="${cls}" data-day="${key}"><span class="cal-num">${d}</span>${chips}${more}</button>`);
+  }
+  while (cells.length % 7 !== 0) {
+    const n = cells.length - lead - dim + 1;
+    cells.push(`<span class="cal-day dim">${n}</span>`);
+  }
+  grid.innerHTML = cells.join("");
+}
+
+$("#calGrid").addEventListener("click", (ev) => {
+  const cell = ev.target.closest("[data-day]");
+  if (!cell) return;
+  openEventDialog(cell.dataset.day);
+});
+
+function openEventDialog(dayKey) {
+  const dlg = $("#eventDialog");
+  const list = eventsDays[dayKey] || [];
+  const [y, m, d] = dayKey.split("-").map(Number);
+  $("#eventDialogTitle").textContent = `${d}/${m}/${y} — ${list.length ? list.length + " sự kiện" : "không có sự kiện"}`;
+  $("#eventDialogBody").innerHTML = list.length ? list.map((e) => {
+    const imp = String(e.impact || "—").toUpperCase();
+    const rows = [
+      `<div class="kv"><span>Giờ VN</span><span>${escapeHtml(e.event_vn || (e.all_day ? "Cả ngày" : "—"))}</span></div>`,
+      e.event_utc ? `<div class="kv"><span>UTC</span><span>${escapeHtml(e.event_utc)}</span></div>` : "",
+      `<div class="kv"><span>Impact</span><span>${escapeHtml(imp)}</span></div>`,
+      e.consensus ? `<div class="kv"><span>Consensus</span><span>${escapeHtml(String(e.consensus))}</span></div>` : "",
+      e.prior ? `<div class="kv"><span>Prior</span><span>${escapeHtml(String(e.prior))}</span></div>` : "",
+      e.actual ? `<div class="kv"><span>Actual</span><span>${escapeHtml(String(e.actual))}</span></div>` : "",
+      e.trading_paused ? `<div class="kv"><span>⛔ Signal</span><span>AI nghỉ ${escapeHtml(e.blackout_start_vn || "")} → ${escapeHtml(e.blackout_end_vn || "")}</span></div>` : "",
+      e.url ? `<div class="kv"><span>Nguồn</span><span><a href="${escapeHtml(e.url)}" target="_blank" rel="noopener">financecalendar.com</a></span></div>` : "",
+    ].join("");
+    return `<div class="event-item"><h4>${e.trading_paused ? "⏸ " : ""}${escapeHtml(e.title || e.name || "?")}</h4><div class="form" style="gap:2px">${rows}</div></div>`;
+  }).join("") : emptyBox("Không có sự kiện vĩ mô ngày này.");
+  if (typeof dlg.showModal === "function") dlg.showModal();
+  else dlg.setAttribute("open", "");
+}
+
+$("#eventDialogClose").addEventListener("click", () => {
+  const dlg = $("#eventDialog");
+  if (typeof dlg.close === "function") dlg.close();
+  else dlg.removeAttribute("open");
+});
+
+$("#eventDialog").addEventListener("click", (ev) => {
+  if (ev.target.id === "eventDialog") {
+    const dlg = $("#eventDialog");
+    if (typeof dlg.close === "function") dlg.close();
+  }
+});
+
+function currentMonthKey() {
+  const now = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return `${now.getFullYear()}-${p(now.getMonth() + 1)}`;
+}
+
+$("#calPrev").addEventListener("click", () => { eventsMonth = shiftMonth(eventsMonth || currentMonthKey(), -1); loadEvents().catch((e) => toast(e.message, "error")); });
+$("#calNext").addEventListener("click", () => { eventsMonth = shiftMonth(eventsMonth || currentMonthKey(), 1); loadEvents().catch((e) => toast(e.message, "error")); });
+$("#calToday").addEventListener("click", () => { eventsMonth = null; loadEvents().catch((e) => toast(e.message, "error")); });
+
 // -- refresh ------------------------------------------------------------------
 
 function refresh(panel) {
+  const jobs = [loadEventBanner().catch(() => {})];
   if (panel === "dashboard") {
-    loadDashboard().catch((e) => toast(e.message, "error"));
-    loadChart().catch(() => {});
+    jobs.push(loadDashboard().catch((e) => toast(e.message, "error")));
+    jobs.push(loadChart().catch(() => {}));
   }
-  if (panel === "signals") loadSignals().catch((e) => toast(e.message, "error"));
-  if (panel === "trades") loadTrades().catch((e) => toast(e.message, "error"));
-  if (panel === "statistics") loadStatistics().catch((e) => toast(e.message, "error"));
-  if (panel === "settings") loadSettings().catch((e) => toast(e.message, "error"));
+  if (panel === "signals") jobs.push(loadSignals().catch((e) => toast(e.message, "error")));
+  if (panel === "daemon") jobs.push(loadDaemonLog().catch((e) => toast(e.message, "error")));
+  if (panel === "events") jobs.push(loadEvents().catch((e) => toast(e.message, "error")));
+  if (panel === "trades") jobs.push(loadTrades().catch((e) => toast(e.message, "error")));
+  if (panel === "statistics") jobs.push(loadStatistics().catch((e) => toast(e.message, "error")));
+  if (panel === "settings") jobs.push(loadSettings().catch((e) => toast(e.message, "error")));
+  return Promise.allSettled(jobs);
 }
 
-refresh(current);
-setInterval(() => { if (current === "dashboard") refresh("dashboard"); }, 15000);
+{ const seq = ++loadSeq; showLoader(); refresh(current).then(() => { if (seq === loadSeq) hideLoader(); }); }
+setInterval(() => { if (current === "dashboard") refresh("dashboard"); loadEventBanner().catch(() => {}); if (current === "events") loadEvents().catch(() => {}); }, 15000);
 
 $("#chartInterval").addEventListener("change", () => { chartView = null; loadChart(); });
 
@@ -953,6 +1231,24 @@ $("#sigDeleteSel").addEventListener("click", async () => {
 $("#sigDeleteAll").addEventListener("click", async () => {
   if (!confirm("Delete ALL signal history (except any OPEN position)?\nLinked demo positions/trades will also be deleted. This cannot be undone.")) return;
   try { await deleteSignals({ all: true }); } catch (e) { toast(e.message, "error"); }
+});
+
+["ddDir", "ddTime"].forEach((id) => {
+  $("#" + id).addEventListener("change", () => loadDaemonLog().catch((e) => toast(e.message, "error")));
+});
+
+$("#ddClear").addEventListener("click", () => clearDaemonLog().catch((e) => toast(e.message, "error")));
+
+$("#daemonTable").addEventListener("click", (ev) => {
+  const link = ev.target.closest(".sig-link");
+  if (link) {
+    showPanel("signals");
+    return;
+  }
+  const row = ev.target.closest(".dd-row");
+  if (!row) return;
+  const detail = document.getElementById("dd-detail-" + row.dataset.row);
+  if (detail) detail.hidden = !detail.hidden;
 });
 
 let chartResizeTimer;

@@ -197,7 +197,9 @@ class LLMDecisionProvider:
         candle = candles[-1]
         if not self.force_fresh:
             cached = self.cache.get(self._scope(symbol, timeframe, max_candles), int(candle.timestamp))
-            if cached is not None:
+            # FAILED rows (e.g. a rate-limited call) are never replayed: the
+            # next run retries the live call instead of cementing the failure.
+            if cached is not None and cached.status != DecisionStatus.FAILED:
                 self.stats.add(
                     0.0, cached=True, failed=cached.status == DecisionStatus.FAILED
                 )
@@ -254,14 +256,9 @@ class LLMDecisionProvider:
                 "benchmark model %s failed for candle %s: %s",
                 self.model, candle.timestamp, exc,
             )
+            # Deliberately NOT cached: a FAILED row (rate limit, timeout)
+            # must be retried by the next run, never replayed.
             fallback = self._fallback_analysis(candle, symbol, timeframe)
-            try:
-                self._put_record(
-                    fallback, DecisionStatus.FAILED, candle, symbol, timeframe,
-                    max_candles, latency, error=str(exc)[:_ERROR_CAP],
-                )
-            except Exception as put_exc:  # pragma: no cover - best-effort write
-                logger.warning("could not record benchmark failure: %s", put_exc)
             self.stats.add(latency, cached=False, failed=True)
             return fallback
 

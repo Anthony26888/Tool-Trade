@@ -58,6 +58,12 @@ def _add_config_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--leverage", type=int, default=10)
     parser.add_argument("--fee-rate", type=_decimal_arg, default=Decimal("0.0004"))
     parser.add_argument("--slippage-bps", type=_decimal_arg, default=Decimal("0"))
+    parser.add_argument(
+        "--min-candles",
+        type=int,
+        default=200,
+        help="warmup candles before the first eligible decision (default 200 for EMA200)",
+    )
 
 
 def _build_run_parser() -> argparse.ArgumentParser:
@@ -90,6 +96,7 @@ def _config_from_args(args) -> BacktestConfig:
         leverage=args.leverage,
         fee_rate=args.fee_rate,
         slippage_bps=args.slippage_bps,
+        min_candles=args.min_candles,
     )
 
 
@@ -184,13 +191,34 @@ def _build_benchmark_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="ignore cached decisions and re-call the LLM (truncates decisions.jsonl)",
     )
-    parser.add_argument("--context-version", type=int, default=1)
+    parser.add_argument("--context-version", type=int, default=None)
+    parser.add_argument(
+        "--event-calendar",
+        action="store_true",
+        help="Phase N: load historical FOMC/CPI/NFP blackouts for the dataset "
+        "span (frozen to events.json), skip blackout candles like the live "
+        "gate, and annotate analyzed candles with the event note.",
+    )
+    parser.add_argument(
+        "--positioning",
+        action="store_true",
+        help="Phase P1: fetch historical funding + long/short history for the "
+        "dataset span (frozen to positioning.json) and thread it into prompts "
+        "with the funding guardrail, mirroring live.",
+    )
+    parser.add_argument(
+        "--htf",
+        action="store_true",
+        help="Phase P2: roll the dataset's 1H candles up to 4H, classify the "
+        "trend bias with the live code path, and veto counter-regime entries.",
+    )
     _add_config_args(parser)
     return parser
 
 
 def _cmd_benchmark(argv: list[str]) -> int:
     from .benchmark import run_benchmark
+    from .benchmark.models import CONTEXT_VERSION
 
     parser = _build_benchmark_parser()
     args = parser.parse_args(argv)
@@ -206,16 +234,44 @@ def _cmd_benchmark(argv: list[str]) -> int:
         max_tokens=args.max_tokens,
     )
     out_dir = args.out
+    event_calendar = None
+    if args.event_calendar:
+        from signal_engine.event_calendar import EventCalendar
+
+        event_calendar = EventCalendar()
+    positioning = None
+    if args.positioning:
+        positioning = True  # resolved to history after data loads
     try:
         data = JsonFileHistoricalDataProvider(args.data).get_historical_data()
+        if positioning is True:
+            from binance.client import BinanceFuturesClient
+            from binance.positioning import PositioningHistory
+
+            hours = list(data.hour_candles)
+            positioning = (
+                PositioningHistory.fetch(
+                    BinanceFuturesClient(),
+                    config.symbol,
+                    int(hours[0].timestamp),
+                    int(hours[-1].timestamp),
+                )
+                if hours
+                else PositioningHistory()
+            )
         summary = run_benchmark(
             config=config,
             data=data,
             out_dir=out_dir,
             llm=llm,
-            context_version=args.context_version,
+            context_version=args.context_version
+            if args.context_version is not None
+            else CONTEXT_VERSION,
             dataset_id=args.dataset_id,
             force_fresh=args.force_fresh,
+            event_calendar=event_calendar,
+            positioning=positioning,
+            htf=args.htf,
         )
     except (BacktestError, BacktestMetricError) as exc:
         print(f"benchmark failed: {exc}", file=sys.stderr)
@@ -225,8 +281,11 @@ def _cmd_benchmark(argv: list[str]) -> int:
     statistics = summary.statistics
     quality = summary.summary["model_signal_quality"]
     latency = summary.summary["latency"]
+    resolved_version = (
+        args.context_version if args.context_version is not None else CONTEXT_VERSION
+    )
     print(
-        f"Model           {llm.provider}/{llm.model} ({args.context_version})\n"
+        f"Model           {llm.provider}/{llm.model} ({resolved_version})\n"
         f"Eligible        {result.eligible}\n"
         f"Analyzed        {result.analyzed} (WAIT {result.wait_count} / "
         f"LONG {result.long_decisions} / SHORT {result.short_decisions}) [engine]\n"

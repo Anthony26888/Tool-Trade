@@ -118,6 +118,7 @@ class DemoConfig:
     leverage: int = DEFAULT_LEVERAGE
     risk_percent: Decimal = DEFAULT_RISK_PERCENT
     fee_rate: Decimal = DEFAULT_FEE_RATE
+    slippage_bps: Decimal = Decimal("0")
 
     def __post_init__(self) -> None:
         validate_config(self)
@@ -169,6 +170,10 @@ def validate_config(config: DemoConfig) -> None:
         raise DemoConfigError(str(exc)) from exc
     if config.fee_rate >= 1:
         raise DemoConfigError("fee_rate must be a fraction below 1")
+    try:
+        _require_nonnegative(config.slippage_bps, "slippage_bps")
+    except DemoCalculationError as exc:
+        raise DemoConfigError(str(exc)) from exc
 
 
 @dataclass(frozen=True)
@@ -252,6 +257,36 @@ def position_quantity(position_notional: Any, entry_price: Any) -> Decimal:
     return notional / entry
 
 
+def resolve_quantity(
+    balance: Any,
+    margin_per_trade: Any,
+    leverage: Any,
+    risk_percent: Any,
+    entry_price: Any,
+    stop_loss: Any,
+) -> tuple[Decimal, str]:
+    """Resolve the trade quantity and the rule that bound it.
+
+    ``qty_margin`` comes from fixed-margin sizing (``margin x leverage``);
+    ``qty_risk`` caps the entry-to-stop-loss loss at ``risk_percent`` of the
+    balance. The smaller wins (ties prefer ``"margin"``); the returned rule
+    is ``"margin"`` or ``"risk"`` so callers can log the explicit sizing
+    decision (AGENTS.md section 16: never silently override configuration).
+    """
+    balance_value = _require_positive(balance, "balance")
+    entry = _require_positive(entry_price, "entry_price")
+    stop = _require_positive(stop_loss, "stop_loss")
+    sl_dist = abs(entry - stop)
+    if sl_dist <= 0:
+        raise DemoCalculationError("stop_loss must differ from entry_price")
+    notional = position_size(margin_per_trade, leverage)
+    qty_margin = position_quantity(notional, entry)
+    qty_risk = risk_amount(balance_value, risk_percent) / sl_dist
+    if qty_risk < qty_margin:
+        return qty_risk, "risk"
+    return qty_margin, "margin"
+
+
 def gross_pnl(direction: str, entry_price: Any, exit_price: Any, quantity: Any) -> Decimal:
     """Gross PnL ignoring fees.
 
@@ -280,6 +315,22 @@ def exit_fee(exit_price: Any, quantity: Any, fee_rate: Any) -> Decimal:
     qty = _require_positive(quantity, "quantity")
     rate = _require_nonnegative(fee_rate, "fee_rate")
     return exit_value * qty * rate
+
+
+def slippage_factor(slippage_bps: Any, *, direction: str, entering: bool) -> Decimal:
+    """Adverse fill factor for a bps slippage setting (mirrors backtest).
+
+    LONG pays up on entry and gives up on exit; SHORT mirrors. ``0`` bps
+    returns exactly ``1`` (no-op, the historical default).
+    """
+    bps = _require_nonnegative(slippage_bps, "slippage_bps")
+    if bps == 0:
+        return Decimal("1")
+    _validate_direction(direction)
+    slip = bps / Decimal(10000)
+    if entering:
+        return Decimal("1") + slip if direction == DIRECTION_LONG else Decimal("1") - slip
+    return Decimal("1") - slip if direction == DIRECTION_LONG else Decimal("1") + slip
 
 
 def total_fee(

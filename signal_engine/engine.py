@@ -26,7 +26,9 @@ Invariants
   pre-check is an optimization only.
 - AI lock: when an active signal exists the engine returns
   ``BLOCKED_OPEN_SIGNAL`` *before* invoking the Phase 5 analyzer, so no LLM
-  call is wasted and an already-PENDING signal is never re-analyzed.
+  call is wasted and an already-PENDING signal is never re-analyzed. A
+  PENDING_ENTRY older than ``pending_expiry_hours`` is auto-cancelled first
+  so a fresh analysis may proceed.
 - Immutability: the engine never updates a signal with a later AI result;
   entry/SL/TP/direction/timeframe are fixed at creation and the repository
   exposes no price-updating operation.
@@ -39,17 +41,51 @@ Invariants
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
 from database.database import SignalRepository
-from database.models import Signal, SignalExistsError, SignalValidationError
+from database.models import (
+    STATUS_PENDING_ENTRY,
+    Signal,
+    SignalExistsError,
+    SignalValidationError,
+)
 
 from .analysis import SignalAnalysis
 from .state import SignalState
-from .validator import validate_analysis, validate_decision
+from .validator import (
+    GuardrailConfig,
+    default_guardrails,
+    validate_analysis,
+    validate_decision,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _pending_expired(active: Signal, expiry_hours: float) -> bool:
+    """Return True when a PENDING_ENTRY signal waited past its expiry.
+
+    ``expiry_hours <= 0`` disables expiry (pre-Phase-B behavior: wait forever).
+    Unparseable timestamps never expire (fail safe towards keeping the lock).
+    """
+    if active.status != STATUS_PENDING_ENTRY or expiry_hours <= 0:
+        return False
+    try:
+        created = datetime.fromisoformat(
+            str(active.created_at).replace("Z", "+00:00")
+        )
+    except (ValueError, TypeError, AttributeError):
+        return False
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    age_hours = (datetime.now(timezone.utc) - created).total_seconds() / 3600.0
+    return age_hours > expiry_hours
 
 
 class SignalOutcome(str, Enum):
@@ -117,15 +153,20 @@ class SignalEngine:
         self.repository = repository
         self.state = state if state is not None else SignalState(repository)
 
-    def process(self, analysis: SignalAnalysis) -> SignalEngineResult:
+    def process(
+        self, analysis: SignalAnalysis, *, guardrails: GuardrailConfig | None = None
+    ) -> SignalEngineResult:
         """Convert a single Phase 5 analysis result into a validated signal.
 
         Ordering (highest priority first):
         1. WAIT -> WAIT result (never writes or modifies anything).
-        2. Active signal exists (PENDING_ENTRY or OPEN) -> BLOCKED_OPEN_SIGNAL
+        2. Stale PENDING_ENTRY past ``pending_expiry_hours`` -> auto-cancelled,
+           then the new analysis is validated normally (keeps one active slot).
+        3. Any other active signal (PENDING_ENTRY or OPEN) -> BLOCKED_OPEN_SIGNAL
            (no validation performed; the AI must never run while one is active).
-        3. Validation failure -> REJECTED (never downgrades to WAIT).
-        4. Atomic persist via repository -> CREATED (status PENDING_ENTRY),
+        4. Validation failure (incl. Phase B guardrails) -> REJECTED (never
+           downgrades to WAIT).
+        5. Atomic persist via repository -> CREATED (status PENDING_ENTRY),
            or BLOCKED/REJECTED/ERROR.
         """
         if not isinstance(analysis, SignalAnalysis):
@@ -141,11 +182,30 @@ class SignalEngine:
         if decision == "WAIT":
             return SignalEngineResult.wait()
 
-        if self.state.is_active():
-            return SignalEngineResult.blocked()
+        guards = guardrails if guardrails is not None else default_guardrails()
+        active = self.state.active_signal()
+        if active is not None:
+            if _pending_expired(active, guards.pending_expiry_hours):
+                try:
+                    self.state.cancel(active.id)
+                    logger.info(
+                        "[Engine] auto-cancelled stale PENDING_ENTRY signal %s "
+                        "(expired after %.1fh)",
+                        active.id,
+                        guards.pending_expiry_hours,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[Engine] failed to cancel stale PENDING_ENTRY signal %s: %s",
+                        active.id,
+                        exc,
+                    )
+                    return SignalEngineResult.blocked()
+            else:
+                return SignalEngineResult.blocked()
 
         try:
-            candidate = validate_analysis(analysis)
+            candidate = validate_analysis(analysis, guardrails=guards)
         except SignalValidationError as exc:
             return SignalEngineResult.rejected(str(exc))
 
@@ -183,25 +243,48 @@ class SignalEngine:
         candles: Any,
         indicators: Any,
         analyzer: Callable[[Any, Any], SignalAnalysis],
+        *,
+        guardrails: GuardrailConfig | None = None,
     ) -> SignalEngineResult:
         """Gate the AI first, then analyze and create.
 
         When an active signal (PENDING_ENTRY or OPEN) already exists,
         ``BLOCKED_OPEN_SIGNAL`` is returned and ``analyzer`` is never called,
-        so no LLM call is wasted. ``analyzer`` must accept ``(candles, indicators)``
+        so no LLM call is wasted. A stale PENDING_ENTRY past
+        ``pending_expiry_hours`` is auto-cancelled first so a fresh analysis
+        may proceed. ``analyzer`` must accept ``(candles, indicators)``
         positionally and return a Phase 5 ``SignalAnalysis`` (e.g. a wrapped
         ``signal_engine.analysis.analyze_signal``). A race after the gate is
         still caught by the repository transaction.
         """
-        if self.state.is_active():
-            return SignalEngineResult.blocked()
+        guards = guardrails if guardrails is not None else default_guardrails()
+        active = self.state.active_signal()
+        if active is not None:
+            if _pending_expired(active, guards.pending_expiry_hours):
+                try:
+                    self.state.cancel(active.id)
+                    logger.info(
+                        "[Engine] auto-cancelled stale PENDING_ENTRY signal %s "
+                        "(expired after %.1fh)",
+                        active.id,
+                        guards.pending_expiry_hours,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[Engine] failed to cancel stale PENDING_ENTRY signal %s: %s",
+                        active.id,
+                        exc,
+                    )
+                    return SignalEngineResult.blocked()
+            else:
+                return SignalEngineResult.blocked()
 
         try:
             analysis = analyzer(candles, indicators)
         except Exception as exc:
             return SignalEngineResult.error(f"AI analysis failed: {exc}")
 
-        return self.process(analysis)
+        return self.process(analysis, guardrails=guards)
 
 
 __all__ = [
