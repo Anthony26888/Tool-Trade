@@ -297,6 +297,23 @@ class WebApiTestCase(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("error", json.loads(raw))
 
+    def test_signals_offset_pagination(self):
+        repo = SignalRepository(self.db)
+        ids = []
+        for _ in range(3):
+            sig_id = repo.create_signal(
+                "BTCUSDT", "1h", "LONG", Decimal("100.00"), Decimal("99.00"), Decimal("101.00")
+            ).id
+            repo.transition_signal(sig_id, STATUS_OPEN)
+            repo.transition_signal(sig_id, STATUS_TP_HIT, close_price="101.00", result="WIN")
+            ids.append(sig_id)
+        _, page1 = self.get_json("/api/signals?limit=2&offset=0")
+        _, page2 = self.get_json("/api/signals?limit=2&offset=2")
+        self.assertEqual([s["id"] for s in page1["signals"]], ids[::-1][:2])
+        self.assertEqual([s["id"] for s in page2["signals"]], ids[::-1][2:])
+        _, negative = self.get_json("/api/signals?limit=2&offset=-5")
+        self.assertEqual([s["id"] for s in negative["signals"]], ids[::-1][:2])
+
     def test_delete_signals_endpoint(self):
         repo = SignalRepository(self.db)
         signal_id = repo.create_signal(
@@ -622,6 +639,12 @@ class WebApiTestCase(unittest.TestCase):
             symbol="BTCUSDT", timeframe="1h", candle_timestamp_ms=1_720_003_600_000,
             outcome="WAIT", decision="WAIT",
         )
+        repo.upsert(
+            symbol="BTCUSDT", timeframe="1h", candle_timestamp_ms=1_720_007_200_000,
+            outcome="CREATED", decision="SHORT", llm_calls=1,
+            prompt_tokens=1600, completion_tokens=120, total_tokens=1720,
+            tokens_estimated=True,
+        )
         _, data = self.get_json("/api/daemon-log")
         by_ts = {r["candle_timestamp_ms"]: r for r in data["rows"]}
         created = by_ts[1_720_000_000_000]
@@ -629,9 +652,13 @@ class WebApiTestCase(unittest.TestCase):
         self.assertEqual(created["prompt_tokens"], 10500)
         self.assertEqual(created["completion_tokens"], 1800)
         self.assertEqual(created["total_tokens"], 12300)
+        self.assertEqual(created["tokens_estimated"], 0)
         wait = by_ts[1_720_003_600_000]
         self.assertIsNone(wait["llm_calls"])
         self.assertIsNone(wait["total_tokens"])
+        estimated = by_ts[1_720_007_200_000]
+        self.assertEqual(estimated["tokens_estimated"], 1)
+        self.assertEqual(estimated["prompt_tokens"], 1600)
 
 
 def _sample_candles(count: int = 30) -> list[Candle]:
@@ -1015,6 +1042,211 @@ class ChartApiTestCase(unittest.TestCase):
         for marker in ("showLoader", "hideLoader", "Promise.allSettled(jobs)", "loadSeq"):
             self.assertIn(marker, raw)
 
+    def test_static_daemon_pager(self):
+        import shutil
+        import subprocess
+
+        status, raw = _request(self.base + "/")
+        self.assertEqual(status, 200)
+        self.assertIn('id="daemonPager"', raw)
+        self.assertIn('id="signalsPager"', raw)
+        status, js = _request(self.base + "/static/app.js")
+        self.assertEqual(status, 200)
+        for marker in (
+            "DD_PAGE_SIZE",
+            "renderDaemonPager",
+            'data-pg="prev"',
+            'data-pg="next"',
+            "pager-label",
+            "ddPage = 0",
+        ):
+            self.assertIn(marker, js)
+        status, css = _request(self.base + "/static/style.css")
+        self.assertEqual(status, 200)
+        self.assertIn(".pager", css)
+        if shutil.which("node") is None:
+            self.skipTest("node is not installed")
+        start = js.index("function renderDaemonPager(")
+        depth = 0
+        for pos in range(start, len(js)):
+            if js[pos] == "{":
+                depth += 1
+            elif js[pos] == "}":
+                depth -= 1
+                if depth == 0:
+                    fn = js[start : pos + 1]
+                    break
+        program = (
+            "let ddPage = 0;\n"
+            "const DD_PAGE_SIZE = 50;\n"
+            "let _el = null;\n"
+            "const $ = () => _el;\n"
+            + fn + "\n"
+            "const out = [];\n"
+            "const snap = () => ({ hidden: _el.hidden, html: _el.innerHTML });\n"
+            "_el = { hidden: false, innerHTML: '' };\n"
+            "ddPage = 0; renderDaemonPager(false); out.push(['first-no-more', snap()]);\n"
+            "ddPage = 0; renderDaemonPager(true); out.push(['first-more', snap()]);\n"
+            "ddPage = 2; renderDaemonPager(true); out.push(['mid-more', snap()]);\n"
+            "ddPage = 2; renderDaemonPager(false); out.push(['mid-last', snap()]);\n"
+            "console.log(JSON.stringify(out));"
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as handle:
+            handle.write(program)
+            path = handle.name
+        try:
+            proc = subprocess.run(
+                ["node", path], capture_output=True, text=True, timeout=60
+            )
+        finally:
+            os.unlink(path)
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr[-1000:])
+        states = dict(json.loads(proc.stdout.strip().splitlines()[-1]))
+        # Single short page: pager hides itself.
+        self.assertTrue(states["first-no-more"]["hidden"])
+        # First page with more: prev disabled, next enabled, label page 1.
+        first = states["first-more"]
+        self.assertFalse(first["hidden"])
+        self.assertIn("Trang 1", first["html"])
+        self.assertIn('data-pg="prev" disabled', first["html"])
+        self.assertNotIn('data-pg="next" disabled', first["html"])
+        # Middle page: both enabled.
+        mid = states["mid-more"]
+        self.assertIn("Trang 3", mid["html"])
+        self.assertNotIn("disabled", mid["html"])
+        # Last page: next disabled, prev enabled.
+        last = states["mid-last"]
+        self.assertIn('data-pg="next" disabled', last["html"])
+        self.assertNotIn('data-pg="prev" disabled', last["html"])
+
+    def test_static_signals_pager(self):
+        import shutil
+        import subprocess
+
+        status, js = _request(self.base + "/static/app.js")
+        self.assertEqual(status, 200)
+        for marker in (
+            "SIG_PAGE_SIZE",
+            "renderSignalsPager",
+            "sigPage = 0",
+            "signalsPager",
+        ):
+            self.assertIn(marker, js)
+        if shutil.which("node") is None:
+            self.skipTest("node is not installed")
+        start = js.index("function renderSignalsPager(")
+        depth = 0
+        for pos in range(start, len(js)):
+            if js[pos] == "{":
+                depth += 1
+            elif js[pos] == "}":
+                depth -= 1
+                if depth == 0:
+                    fn = js[start : pos + 1]
+                    break
+        program = (
+            "let sigPage = 0;\n"
+            "const SIG_PAGE_SIZE = 25;\n"
+            "let _el = null;\n"
+            "const $ = () => _el;\n"
+            + fn + "\n"
+            "_el = { hidden: false, innerHTML: '' };\n"
+            "sigPage = 0; renderSignalsPager(false);\n"
+            "const hidden = _el.hidden;\n"
+            "sigPage = 1; renderSignalsPager(true);\n"
+            "const mid = _el.innerHTML;\n"
+            "console.log(JSON.stringify([hidden, mid]));"
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as handle:
+            handle.write(program)
+            path = handle.name
+        try:
+            proc = subprocess.run(
+                ["node", path], capture_output=True, text=True, timeout=60
+            )
+        finally:
+            os.unlink(path)
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr[-1000:])
+        hidden, mid = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertTrue(hidden)
+        self.assertIn("Trang 2", mid)
+        self.assertNotIn("disabled", mid)
+
+    def test_static_daemon_detail_sections(self):
+        status, raw = _request(self.base + "/static/app.js")
+        self.assertEqual(status, 200)
+        for marker in (
+            "dd-sec-title",
+            "dd-levels",
+            "dd-level sl",
+            "dd-level tp",
+            "dd-stats",
+            "dd-stat",
+            "dd-ind-grid",
+            "dd-ind-group",
+            "Tokens in/out/total",
+            "(~)",
+            "tokens_estimated",
+            "Nhận định AI",
+        ):
+            self.assertIn(marker, raw)
+        status, css = _request(self.base + "/static/style.css")
+        self.assertEqual(status, 200)
+        for marker in (
+            ".dd-sec-title",
+            ".dd-levels",
+            ".dd-level.sl strong",
+            ".dd-level.tp strong",
+            ".dd-stats",
+            ".dd-ind-grid",
+        ):
+            self.assertIn(marker, css)
+
+    def test_dd_risk_reward_logic(self):
+        import shutil
+        import subprocess
+
+        if shutil.which("node") is None:
+            self.skipTest("node is not installed")
+        status, raw = _request(self.base + "/static/app.js")
+        self.assertEqual(status, 200)
+        start = raw.index("function ddRiskReward(")
+        depth = 0
+        for pos in range(start, len(raw)):
+            if raw[pos] == "{":
+                depth += 1
+            elif raw[pos] == "}":
+                depth -= 1
+                if depth == 0:
+                    fn = raw[start : pos + 1]
+                    break
+        program = (
+            "const fmtNum = (v, d) => Number(v).toFixed(d);\n" + fn + "\nconsole.log(JSON.stringify(["
+            "ddRiskReward({decision:'LONG',entry:80310,stop_loss:81003,take_profit:78067}),"
+            "ddRiskReward({decision:'SHORT',entry:80310,stop_loss:81003,take_profit:78067}),"
+            "ddRiskReward({decision:'WAIT'}),"
+            "ddRiskReward({decision:'LONG',entry:1,stop_loss:1,take_profit:1}),"
+            "]));"
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as handle:
+            handle.write(program)
+            path = handle.name
+        try:
+            proc = subprocess.run(
+                ["node", path], capture_output=True, text=True, timeout=60
+            )
+        finally:
+            os.unlink(path)
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr[-1000:])
+        long_inverted, short_valid, wait_rr, flat_rr = json.loads(
+            proc.stdout.strip().splitlines()[-1]
+        )
+        # LONG 80310/81003/78067 is inverted -> no RR; SHORT gives ~3.24.
+        self.assertEqual(long_inverted, "")
+        self.assertTrue(short_valid.startswith("RR 3.2"))
+        self.assertEqual(wait_rr, "")
+        self.assertEqual(flat_rr, "")
+
     def test_static_daemon_table_shows_quota(self):
         status, raw = _request(self.base + "/static/app.js")
         self.assertEqual(status, 200)
@@ -1022,8 +1254,11 @@ class ChartApiTestCase(unittest.TestCase):
             "<th>Calls</th>",
             'data-label="Calls"',
             'colspan="10"',
-            "tokens in / out / total",
-            "LLM calls",
+            "Tokens in/out/total",
+            "ddLevelsSection",
+            "ddQuotaSection",
+            "ddIndicatorsSection",
+            "ddRiskReward",
         ):
             self.assertIn(marker, raw)
 

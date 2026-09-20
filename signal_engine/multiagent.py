@@ -50,8 +50,12 @@ from .analysis import (
     SignalDecision,
     SignalDecisionModel,
     _bind_structured,
+    _bind_structured_raw,
+    _call_structured,
+    _estimate_usage,
     _extract_usage,
     _is_rate_limited,
+    _prompt_text,
     _reset_hint,
     _snapshot_atr,
     _validate_decision_rules,
@@ -339,6 +343,16 @@ class MultiAgentSignalAnalyzer:
                 ("risk", RiskStep, _ROLE_NAMES["risk"]),
             )
         }
+        self.structured_llm_raw = {
+            name: _bind_structured_raw(self.llm, schema, agent_name)
+            for name, schema, agent_name in (
+                ("analyst", AnalystStep, _ROLE_NAMES["analyst"]),
+                ("bull", CaseStep, _ROLE_NAMES["bull"]),
+                ("bear", CaseStep, _ROLE_NAMES["bear"]),
+                ("trader", SignalDecisionModel, _ROLE_NAMES["trader"]),
+                ("risk", RiskStep, _ROLE_NAMES["risk"]),
+            )
+        }
 
     def analyze(
         self,
@@ -371,27 +385,27 @@ class MultiAgentSignalAnalyzer:
             positioning=positioning,
             htf_note=htf_note,
         )
-        analyst, usage = self._step("analyst", AnalystStep, _analyst_prompt(context))
-        calls, totals = 1, _accumulate_totals(None, usage)
-        bull, usage = self._step("bull", CaseStep, _case_prompt(_BULL_SYSTEM, context, analyst))
-        calls, totals = calls + 1, _accumulate_totals(totals, usage)
-        bear, usage = self._step("bear", CaseStep, _case_prompt(_BEAR_SYSTEM, context, analyst))
-        calls, totals = calls + 1, _accumulate_totals(totals, usage)
-        trader, usage = self._step(
+        analyst, usage, analyst_est = self._step("analyst", AnalystStep, _analyst_prompt(context))
+        calls, totals, estimated = 1, _accumulate_totals(None, usage), analyst_est
+        bull, usage, step_est = self._step("bull", CaseStep, _case_prompt(_BULL_SYSTEM, context, analyst))
+        calls, totals, estimated = calls + 1, _accumulate_totals(totals, usage), estimated or step_est
+        bear, usage, step_est = self._step("bear", CaseStep, _case_prompt(_BEAR_SYSTEM, context, analyst))
+        calls, totals, estimated = calls + 1, _accumulate_totals(totals, usage), estimated or step_est
+        trader, usage, step_est = self._step(
             "trader",
             SignalDecisionModel,
             _trader_prompt(context, analyst, bull, bear),
         )
-        calls, totals = calls + 1, _accumulate_totals(totals, usage)
-        risk, usage = self._step(
+        calls, totals, estimated = calls + 1, _accumulate_totals(totals, usage), estimated or step_est
+        risk, usage, step_est = self._step(
             "risk", RiskStep, _risk_prompt(context, analyst, bull, bear, trader)
         )
-        calls, totals = calls + 1, _accumulate_totals(totals, usage)
+        calls, totals, estimated = calls + 1, _accumulate_totals(totals, usage), estimated or step_est
         decision_model = _validate_decision_rules(risk)
         _validate_ordering(decision_model)
         return self._to_analysis(
             context, decision_model, trader, risk, llm_calls=calls, usage=totals,
-            funding_rate=funding_rate, regime=regime,
+            funding_rate=funding_rate, regime=regime, tokens_estimated=estimated,
         )
 
     def _step(
@@ -399,22 +413,24 @@ class MultiAgentSignalAnalyzer:
         name: str,
         schema: type[BaseModel],
         prompt: list[dict[str, str]],
-    ) -> tuple[BaseModel, dict[str, int | None] | None]:
+    ) -> tuple[BaseModel, dict[str, int | None] | None, bool]:
         agent_name = _ROLE_NAMES[name]
         structured = self.structured_llm[name]
+        structured_raw = self.structured_llm_raw[name]
         usage: dict[str, int | None] | None = None
+        estimated = False
         try:
-            if structured is not None:
-                raw = structured.invoke(prompt)
-                if raw is None:
-                    raise SignalAnalysisError(
-                        f"{agent_name} structured-output invocation returned "
-                        "no parsed result"
-                    )
+            if structured is not None or structured_raw is not None:
+                raw, usage = _call_structured(
+                    structured, structured_raw, prompt, agent_name
+                )
             else:
                 response = self.llm.invoke(prompt)
                 usage = _extract_usage(response)
                 raw = getattr(response, "content", response)
+            if usage is None:
+                usage = _estimate_usage(_prompt_text(prompt), raw)
+                estimated = True
         except SignalAnalysisError:
             raise
         except Exception as exc:  # noqa: BLE001 - normalize any LLM error
@@ -424,7 +440,7 @@ class MultiAgentSignalAnalyzer:
                     f"{agent_name} LLM rate limit{_reset_hint(text)}: {exc}"
                 ) from exc
             raise SignalAnalysisError(f"{agent_name} LLM analysis failed: {exc}") from exc
-        return _coerce_step(raw, schema, agent_name), usage
+        return _coerce_step(raw, schema, agent_name), usage, estimated
 
     def _to_analysis(
         self,
@@ -437,6 +453,7 @@ class MultiAgentSignalAnalyzer:
         usage: dict[str, int | None] | None = None,
         funding_rate: float | None = None,
         regime: str | None = None,
+        tokens_estimated: bool = False,
     ) -> SignalAnalysis:
         reasoning = f"{risk.reasoning}\n[Risk note] {risk.risk_note}"
         usage = usage or {}
@@ -465,4 +482,5 @@ class MultiAgentSignalAnalyzer:
             total_tokens=usage.get("total_tokens"),
             funding_rate=funding_rate,
             regime=regime,
+            tokens_estimated=tokens_estimated,
         )

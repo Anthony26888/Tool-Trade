@@ -132,6 +132,7 @@
             <button class="btn danger toolbar-item" id="sigDeleteAll" type="button">Delete all history</button>
           </div>
           <div class="table-wrap" id="signalsTable"><p class="muted">Loading…</p></div>
+          <div class="pager" id="signalsPager" hidden></div>
         </section>
       </section>
 
@@ -160,6 +161,7 @@
             <span class="hint toolbar-item">Click a row for reasoning, indicator snapshot &amp; prices.</span>
           </div>
           <div class="table-wrap" id="daemonTable"><p class="muted">Loading…</p></div>
+          <div class="pager" id="daemonPager" hidden></div>
         </section>
       </section>
 
@@ -185,7 +187,7 @@
             <span>T2</span><span>T3</span><span>T4</span><span>T5</span><span>T6</span><span>T7</span><span>CN</span>
           </div>
           <div class="cal-grid" id="calGrid"><p class="muted">Loading…</p></div>
-          <p class="hint">Tap a day for details. Times in Vietnam (+07). Calendar data: <a href="https://www.financecalendar.com" target="_blank" rel="noopener">financecalendar.com</a></p>
+          <p class="hint">Tap a day for details. Times in Vietnam (+07). Calendar data: <a href="https://www.financecalendar.com" target="_blank" rel="noopener">financecalendar.com</a> · <span id="calSource">Nguồn: …</span></p>
         </section>
         <dialog id="eventDialog" class="event-dialog">
           <div class="event-dialog-head">

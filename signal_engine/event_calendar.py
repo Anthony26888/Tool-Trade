@@ -192,10 +192,18 @@ class EventCalendar:
         self._events: list[ScheduledEvent] = []
         self._last_refresh_ms: int | None = None
         self._month_cache: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        #: Where the current cache came from: "live" (API), "fallback"
+        #: (static file), or "none" (nothing loaded yet). Surfaced in the UI
+        #: so a fallback-only view is never mistaken for full coverage.
+        self._source: str = "none"
 
     @property
     def warn_hours(self) -> float:
         return max(0.0, self._warn_hours)
+
+    @property
+    def source(self) -> str:
+        return self._source
 
     # -- refresh ----------------------------------------------------------
 
@@ -217,6 +225,7 @@ class EventCalendar:
             self._events = sorted(events, key=lambda e: e.event_ms)
             self._last_refresh_ms = now_ms
             self._month_cache.clear()
+            self._source = "live"
             logger.info("[Events] calendar refreshed: %d upcoming releases", len(events))
         elif not self._events:
             self._load_fallback()
@@ -302,6 +311,7 @@ class EventCalendar:
             )
         if events:
             self._events = sorted(events, key=lambda e: e.event_ms)
+            self._source = "fallback"
             logger.info(
                 "[Events] using fallback file: %d releases", len(self._events)
             )
@@ -436,11 +446,13 @@ class EventCalendar:
                 API_TIMEOUT_S,
             )
             days = self._group_month(payload)
+            self._source = "live"
         except Exception as exc:
             logger.warning(
                 "[Events] month fetch failed, falling back to static file: %s", exc
             )
             days = self._fallback_month(int(year), int(month))
+            self._source = "fallback"
         self._month_cache[cache_key] = days
         return days
 

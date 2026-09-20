@@ -80,10 +80,21 @@ def _wait_payload(**overrides):
     return values
 
 
-def _structured_llm(model=None, side_effect=None):
+def _structured_llm(model=None, side_effect=None, raw_result=None):
     llm = MagicMock()
     structured = MagicMock()
-    llm.with_structured_output.return_value = structured
+
+    def _bind(schema, **kwargs):
+        if kwargs.get("include_raw"):
+            if raw_result is None:
+                # Simulate a provider without include_raw support.
+                raise TypeError("with_structured_output() got an unexpected keyword 'include_raw'")
+            raw_structured = MagicMock()
+            raw_structured.invoke.return_value = raw_result
+            return raw_structured
+        return structured
+
+    llm.with_structured_output.side_effect = _bind
     if side_effect is not None:
         structured.invoke.side_effect = side_effect
     elif model is not None:
@@ -275,14 +286,96 @@ class TestSignalAnalyzer(unittest.TestCase):
         self.assertEqual(result.completion_tokens, 180)
         self.assertEqual(result.total_tokens, 1680)
 
-    def test_quota_tokens_null_without_metadata(self):
+    def test_quota_tokens_estimated_without_metadata(self):
         candles, indicators = _context_input()
         llm, structured = _structured_llm(SignalDecisionModel(**_long_payload()))
         result = SignalAnalyzer(CONFIG, llm=llm).analyze(candles, indicators)
         self.assertEqual(result.llm_calls, 1)
-        self.assertIsNone(result.prompt_tokens)
-        self.assertIsNone(result.completion_tokens)
-        self.assertIsNone(result.total_tokens)
+        # No usage metadata anywhere: counts are ~4-chars/token estimates,
+        # always flagged so the UI can prefix "~".
+        self.assertTrue(result.tokens_estimated)
+        self.assertGreater(result.prompt_tokens, 0)
+        self.assertGreater(result.completion_tokens, 0)
+        self.assertEqual(
+            result.total_tokens, result.prompt_tokens + result.completion_tokens
+        )
+
+    def test_quota_tokens_metered_via_include_raw(self):
+        from types import SimpleNamespace as _NS
+
+        candles, indicators = _context_input()
+        model = SignalDecisionModel(**_long_payload())
+        raw_message = _NS(
+            usage_metadata={
+                "input_tokens": 1200,
+                "output_tokens": 300,
+                "total_tokens": 1500,
+            }
+        )
+        llm, structured = _structured_llm(
+            model, raw_result={"parsed": model, "raw": raw_message, "parsing_error": None}
+        )
+        result = SignalAnalyzer(CONFIG, llm=llm).analyze(candles, indicators)
+        self.assertFalse(result.tokens_estimated)
+        self.assertEqual(result.prompt_tokens, 1200)
+        self.assertEqual(result.completion_tokens, 300)
+        self.assertEqual(result.total_tokens, 1500)
+        structured.invoke.assert_not_called()
+
+    def test_include_raw_parsing_error_rejected(self):
+        candles, indicators = _context_input()
+        llm, structured = _structured_llm(
+            SignalDecisionModel(**_long_payload()),
+            raw_result={"parsed": None, "raw": None, "parsing_error": "bad json"},
+        )
+        with self.assertRaises(SignalAnalysisError):
+            SignalAnalyzer(CONFIG, llm=llm).analyze(candles, indicators)
+
+    def test_call_structured_shapes(self):
+        from signal_engine.analysis import _call_structured
+
+        model = SignalDecisionModel(**_long_payload())
+        # Metered envelope.
+        raw_msg = SimpleNamespace(
+            usage_metadata={"input_tokens": 10, "output_tokens": 4, "total_tokens": 14}
+        )
+        raw_variant = MagicMock()
+        raw_variant.invoke.return_value = {
+            "parsed": model,
+            "raw": raw_msg,
+            "parsing_error": None,
+        }
+        content, usage = _call_structured(MagicMock(), raw_variant, "p", "agent")
+        self.assertIs(content, model)
+        self.assertEqual(usage["prompt_tokens"], 10)
+        # Non-dict raw result degrades to the parsed-only binding.
+        plain = MagicMock()
+        plain.invoke.return_value = model
+        odd_raw = MagicMock()
+        odd_raw.invoke.return_value = model
+        content, usage = _call_structured(plain, odd_raw, "p", "agent")[:2]
+        self.assertIs(content, model)
+        self.assertIsNone(usage)
+        plain.invoke.assert_called_once()
+        # Parsing errors and empty results raise like the old path.
+        bad = MagicMock()
+        bad.invoke.return_value = {"parsed": None, "raw": None, "parsing_error": "x"}
+        with self.assertRaises(SignalAnalysisError):
+            _call_structured(plain, bad, "p", "agent")
+        with self.assertRaises(SignalAnalysisError):
+            _call_structured(None, None, "p", "agent")
+
+    def test_prompt_text_and_estimate(self):
+        from signal_engine.analysis import _estimate_usage, _prompt_text
+
+        self.assertEqual(_prompt_text("abc"), "abc")
+        self.assertIn("hi", _prompt_text([{"role": "user", "content": "hi"}]))
+        self.assertIn("yo", _prompt_text([SimpleNamespace(content="yo")]))
+        est = _estimate_usage("x" * 400, SimpleNamespace())
+        self.assertEqual(est["prompt_tokens"], 100)
+        self.assertEqual(
+            est["total_tokens"], est["prompt_tokens"] + est["completion_tokens"]
+        )
 
     def test_extract_usage_variants(self):
         self.assertEqual(

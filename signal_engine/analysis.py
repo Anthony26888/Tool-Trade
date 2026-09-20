@@ -222,6 +222,103 @@ def _bind_structured(llm: Any, schema: type[BaseModel], agent_name: str) -> Any 
         return None
 
 
+def _bind_structured_raw(
+    llm: Any, schema: type[BaseModel], agent_name: str
+) -> Any | None:
+    """Return ``with_structured_output(schema, include_raw=True)`` or None.
+
+    The raw envelope keeps the provider's usage metadata that the parsed-only
+    path drops (this is why token columns are NULL on OpenRouter free). Any
+    provider quirk (unexpected kwarg, unimplemented, missing method) falls
+    back to the parsed-only binding instead of raising.
+    """
+    try:
+        return llm.with_structured_output(schema, include_raw=True)
+    except (NotImplementedError, AttributeError, TypeError) as exc:
+        logger.debug(
+            "%s: provider does not support include_raw (%s); "
+            "usage metadata will be estimated",
+            agent_name, exc,
+        )
+        return None
+
+
+def _prompt_text(prompt: Any) -> str:
+    """Flatten a chat prompt (list of message dicts or plain str) to text."""
+    if isinstance(prompt, str):
+        return prompt
+    if isinstance(prompt, list):
+        parts = []
+        for message in prompt:
+            if isinstance(message, dict):
+                parts.append(str(message.get("content", "")))
+            else:
+                parts.append(str(getattr(message, "content", message)))
+        return "\n".join(parts)
+    return str(prompt)
+
+
+def _estimate_usage(prompt_text: str, parsed: Any) -> dict[str, int]:
+    """Rough token estimate (~4 chars/token) when the provider reports none.
+
+    Always labeled estimated downstream (``~`` in the UI, ``tokens_estimated``
+    in storage): better than NULL for quota review, never confused with a
+    metered count.
+    """
+    try:
+        rendered = parsed.model_dump_json() if hasattr(parsed, "model_dump_json") else str(parsed)
+    except Exception:
+        rendered = ""
+    prompt_tokens = max(1, len(prompt_text) // 4)
+    completion_tokens = max(1, len(rendered) // 4)
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+
+
+def _call_structured(
+    structured: Any,
+    structured_raw: Any,
+    prompt: Any,
+    agent_name: str,
+) -> tuple[Any, dict[str, int | None] | None]:
+    """Invoke structured output, preferring the raw envelope for usage.
+
+    Returns ``(content, usage)`` with the provider count (or None when the
+    envelope carries none — callers apply the shared estimate fallback).
+    A non-dict result (e.g. test doubles bound without ``include_raw``)
+    degrades to the parsed-only path. Raises are left to the caller, which
+    already maps rate limits and failures.
+    """
+    if structured_raw is not None:
+        result = structured_raw.invoke(prompt)
+        if isinstance(result, dict) and result.get("parsed") is not None:
+            raw_message = result.get("raw")
+            return result["parsed"], _extract_usage(raw_message)
+        if isinstance(result, dict) and result.get("parsing_error") is not None:
+            raise SignalAnalysisError(
+                f"{agent_name} structured-output parsing failed: "
+                f"{result.get('parsing_error')}"
+            )
+        if result is None:
+            raise SignalAnalysisError(
+                f"{agent_name} structured-output invocation returned no parsed result"
+            )
+        # Unexpected shape: fall through to the parsed-only binding.
+    if structured is None:
+        raise SignalAnalysisError(
+            f"{agent_name} has no structured-output binding"
+        )
+    content = structured.invoke(prompt)
+    if content is None:
+        raise SignalAnalysisError(
+            f"{agent_name} structured-output invocation returned no parsed result"
+        )
+    return content, None
+
+
 def _validate_decision_rules(model: SignalDecisionModel) -> SignalDecisionModel:
     """Enforce cross-field decision rules that pydantic cannot express."""
     if model.decision == SignalDecision.WAIT:
@@ -307,6 +404,10 @@ class SignalAnalysis:
     #: regime guardrail can veto counter-trend entries. None = unclear or
     #: unavailable = no check.
     regime: str | None = None
+    #: True when the token counts are a ~4-chars-per-token estimate (the
+    #: provider dropped the usage metadata). The UI prefixes such counts
+    #: with "~" so they are never confused with metered counts.
+    tokens_estimated: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -332,6 +433,7 @@ class SignalAnalysis:
             "total_tokens": self.total_tokens,
             "funding_rate": self.funding_rate,
             "regime": self.regime,
+            "tokens_estimated": self.tokens_estimated,
         }
 
 
@@ -392,6 +494,11 @@ class SignalAnalyzer:
         self.structured_llm = _bind_structured(
             self.llm, SignalDecisionModel, "BTCUSDT Signal Analyzer"
         )
+        #: Raw-envelope variant (include_raw) for usage metadata; None when
+        #: the provider cannot bind it (parsed-only path + estimate then).
+        self.structured_llm_raw = _bind_structured_raw(
+            self.llm, SignalDecisionModel, "BTCUSDT Signal Analyzer"
+        )
 
     def analyze(
         self,
@@ -424,28 +531,33 @@ class SignalAnalyzer:
             positioning=positioning,
             htf_note=htf_note,
         )
-        decision_model, usage = self._invoke(context)
+        decision_model, usage, estimated = self._invoke(context)
         return self._to_analysis(
             context, decision_model, usage=usage, funding_rate=funding_rate,
-            regime=regime,
+            regime=regime, tokens_estimated=estimated,
         )
 
     def _invoke(
         self, context: AnalysisContext
-    ) -> tuple[SignalDecisionModel, dict[str, int | None] | None]:
+    ) -> tuple[SignalDecisionModel, dict[str, int | None] | None, bool]:
         prompt = build_prompt(context)
         usage: dict[str, int | None] | None = None
+        estimated = False
         try:
-            if self.structured_llm is not None:
-                raw = self.structured_llm.invoke(prompt)
-                if raw is None:
-                    raise SignalAnalysisError(
-                        "structured-output invocation returned no parsed result"
-                    )
+            if self.structured_llm is not None or self.structured_llm_raw is not None:
+                raw, usage = _call_structured(
+                    self.structured_llm,
+                    self.structured_llm_raw,
+                    prompt,
+                    "BTCUSDT Signal Analyzer",
+                )
             else:
                 response = self.llm.invoke(prompt)
                 usage = _extract_usage(response)
                 raw = getattr(response, "content", response)
+            if usage is None:
+                usage = _estimate_usage(_prompt_text(prompt), raw)
+                estimated = True
         except SignalAnalysisError:
             raise
         except Exception as exc:
@@ -455,7 +567,7 @@ class SignalAnalyzer:
                     f"LLM rate limit{_reset_hint(text)}: {exc}"
                 ) from exc
             raise SignalAnalysisError(f"LLM analysis failed: {exc}") from exc
-        return _coerce_decision(raw), usage
+        return _coerce_decision(raw), usage, estimated
 
     def _to_analysis(
         self,
@@ -465,6 +577,7 @@ class SignalAnalyzer:
         usage: dict[str, int | None] | None = None,
         funding_rate: float | None = None,
         regime: str | None = None,
+        tokens_estimated: bool = False,
     ) -> SignalAnalysis:
         usage = usage or {}
         return SignalAnalysis(
@@ -492,6 +605,7 @@ class SignalAnalyzer:
             total_tokens=usage.get("total_tokens"),
             funding_rate=funding_rate,
             regime=regime,
+            tokens_estimated=tokens_estimated,
         )
 
 

@@ -268,11 +268,14 @@ class TestCandleLogRepository:
             assert len(rows) == 1
             assert rows[0].outcome == "WAIT"
             assert rows[0].llm_calls is None
+            assert rows[0].tokens_estimated is None  # added NULL by migration
             migrated.upsert(
                 symbol=SYMBOL, timeframe=TIMEFRAME, candle_timestamp_ms=NEXT_CANDLE_MS,
                 outcome="CREATED", decision="LONG", llm_calls=1, total_tokens=1500,
+                tokens_estimated=True,
             )
             assert migrated.list(limit=2)[0].total_tokens == 1500
+            assert migrated.list(limit=2)[0].tokens_estimated == 1
 
     def test_clear_removes_all_rows(self, repo):
         repo.upsert(

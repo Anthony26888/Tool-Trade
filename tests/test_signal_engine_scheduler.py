@@ -1044,6 +1044,24 @@ class TestCandleLog(SchedulerTestCase):
         self.assertEqual(entry.prompt_tokens, 10500)
         self.assertEqual(entry.completion_tokens, 1800)
         self.assertEqual(entry.total_tokens, 12300)
+        self.assertFalse(entry.tokens_estimated)
+
+    def test_quota_estimated_flag_recorded(self):
+        import dataclasses
+
+        def analyzer(candles, indicators):
+            base = make_analysis("WAIT")
+            return dataclasses.replace(
+                base, llm_calls=1, prompt_tokens=1600,
+                completion_tokens=120, total_tokens=1720,
+                tokens_estimated=True,
+            )
+
+        sched = self.build(analyzer=analyzer)
+        self.assertEqual(sched.tick(now=NOW).outcome, SchedulerOutcome.WAIT)
+        entry = self.rows()[0]
+        self.assertEqual(entry.prompt_tokens, 1600)
+        self.assertTrue(entry.tokens_estimated)
 
     def test_quota_defaults_single_call_without_tokens(self):
         calls: list = []

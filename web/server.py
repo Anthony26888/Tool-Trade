@@ -171,6 +171,7 @@ def _candle_log_json(entry) -> dict[str, Any]:
         "prompt_tokens": entry.prompt_tokens,
         "completion_tokens": entry.completion_tokens,
         "total_tokens": entry.total_tokens,
+        "tokens_estimated": entry.tokens_estimated,
     }
 
 
@@ -470,12 +471,14 @@ class WebApplication:
         direction: str | None = None,
         since: str | None = None,
         until: str | None = None,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         """Ledger read-out; optional filters are passed to the repository."""
         return [
             _signal_json(s)
             for s in self._signals.list_signals(
                 limit=int(limit),
+                offset=max(0, int(offset)),
                 status=status,
                 direction=direction,
                 created_since=since,
@@ -540,10 +543,11 @@ class WebApplication:
             return {
                 "active": status.active.to_dict() if status.active else None,
                 "upcoming": [e.to_dict() for e in status.upcoming[:4]],
+                "source": self._events.source,
             }
         except Exception as exc:
             logger.warning("[Web] events payload failed: %s", exc)
-            return {"active": None, "upcoming": []}
+            return {"active": None, "upcoming": [], "source": "none"}
 
     def events_calendar(self, month: str | None) -> dict[str, Any]:
         """Phase N month grid for the Events tab (``YYYY-MM``, default now)."""
@@ -558,11 +562,12 @@ class WebApplication:
             return {
                 "month": f"{year:04d}-{mon:02d}",
                 "days": days,
+                "source": self._events.source,
                 "attribution": "https://www.financecalendar.com",
             }
         except Exception as exc:
             logger.warning("[Web] events calendar failed: %s", exc)
-            return {"month": month or "", "days": {}, "attribution": ""}
+            return {"month": month or "", "days": {}, "source": "none", "attribution": ""}
 
     def positioning(self) -> dict[str, Any]:
         """Phase P1 live futures positioning (funding/OI/long-short).
@@ -781,6 +786,7 @@ class _JsonHandler(BaseHTTPRequestHandler):
                 direction = query.get("direction", [""])[0] or None
                 since = query.get("since", [""])[0] or None
                 until = query.get("until", [""])[0] or None
+                offset = int(query.get("offset", ["0"])[0])
                 self._ok(
                     {
                         "signals": self.app.signals(
@@ -789,6 +795,7 @@ class _JsonHandler(BaseHTTPRequestHandler):
                             direction=direction,
                             since=since,
                             until=until,
+                            offset=offset,
                         )
                     }
                 )

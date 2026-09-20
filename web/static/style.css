@@ -133,6 +133,22 @@ th { color: var(--muted); font-weight: 500; }
 .dd-detail td { background: #0d1620; }
 .dd-detail-box { display: flex; flex-direction: column; gap: 6px; padding: 6px 2px; }
 .dd-detail-box .indc { font-size: 11px; color: var(--muted); }
+.dd-sec { border-top: 1px solid var(--border); padding-top: 8px; margin-top: 4px; }
+.dd-sec:first-child { border-top: none; padding-top: 0; margin-top: 0; }
+.dd-sec-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px; color: var(--muted); margin-bottom: 8px; }
+.dd-levels { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.dd-level { border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; display: flex; flex-direction: column; gap: 2px; }
+.dd-level span { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+.dd-level strong { font-size: 15px; }
+.dd-level.sl strong { color: var(--red); }
+.dd-level.tp strong { color: var(--green); }
+.dd-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+.dd-stat { border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.dd-stat span { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+.dd-stat strong { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dd-ind-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; }
+.dd-ind-group { border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; }
+.dd-ind-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: var(--accent); margin-bottom: 4px; }
 .dd-reason { margin-top: 4px; font-size: 13px; line-height: 1.5; white-space: pre-wrap; }
 .dd-reason.err { color: var(--red); }
 
@@ -412,10 +428,10 @@ pre.raw { margin: 0; font-size: 12px; white-space: pre-wrap; color: var(--muted)
 
 .cal-nav { display: flex; gap: 8px; }
 .cal-month { margin: 4px 0 12px; font-size: 16px; }
-.cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; }
+.cal-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 6px; }
 .cal-week { margin-bottom: 6px; font-size: 12px; color: var(--muted); text-align: center; }
 .cal-day {
-  min-height: 64px; border: 1px solid var(--border); border-radius: 10px;
+  min-height: 64px; min-width: 0; overflow: hidden; border: 1px solid var(--border); border-radius: 10px;
   background: transparent; color: var(--text); padding: 6px;
   display: flex; flex-direction: column; gap: 4px; align-items: flex-start;
   font-size: 13px; cursor: pointer; text-align: left;
@@ -442,6 +458,12 @@ span.cal-day { cursor: default; }
 .event-item { margin-bottom: 14px; }
 .event-item h4 { margin: 0 0 6px; font-size: 14px; }
 
+/* Daemon-log pager */
+.pager { display: flex; align-items: center; justify-content: center; gap: 12px; margin-top: 12px; }
+.pager[hidden] { display: none; }
+.pager-label { font-size: 13px; color: var(--muted); }
+.pager .btn[disabled] { opacity: 0.4; cursor: default; }
+
 /* Phase P1: long/short positioning bar under the chart */
 .ls-bar { margin-top: 10px; }
 .ls-track { display: flex; height: 10px; border-radius: 999px; overflow: hidden; background: var(--border); }
@@ -457,4 +479,7 @@ span.cal-day { cursor: default; }
   .cal-chip.imp-high { background: var(--red); }
   .cal-chip.imp-medium { background: var(--amber); }
   .cal-chip.imp-low { background: var(--muted); }
+  .dd-levels { grid-template-columns: 1fr; }
+  .dd-stats { grid-template-columns: repeat(2, 1fr); }
+  .dd-ind-grid { grid-template-columns: 1fr; }
 }

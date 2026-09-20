@@ -38,6 +38,7 @@ from tests.signal_engine_test_helpers import (
     make_analysis,
     make_candles,
 )
+from web.server import WebApplication
 
 FOMC_ISO = "2026-10-28T18:00:00+00:00"
 FOMC_MS = int(
@@ -745,6 +746,70 @@ class TestBacktestBlackout(unittest.TestCase):
         self.assertIn("Event candle", seen["note"])
 
 
+# ── source tracking ────────────────────────────────────────────────────
+
+
+@pytest.mark.unit
+class TestCalendarSource(unittest.TestCase):
+    def test_live_source_after_api_success(self):
+        cal = EventCalendar(
+            fetcher=next_payload({"fomc": FOMC_ISO, "cpi": FOMC_ISO, "nfp": FOMC_ISO}),
+            warn_hours=12,
+        )
+        self.assertEqual(cal.source, "none")
+        cal.check(FOMC_MS)
+        self.assertEqual(cal.source, "live")
+
+    def test_fallback_source_when_api_down(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "fallback.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "events": [
+                            {
+                                "series": "fomc",
+                                "name": "FOMC decision",
+                                "title": "FOMC fallback",
+                                "time_utc": FOMC_ISO,
+                                "impact": "high",
+                            }
+                        ]
+                    },
+                    handle,
+                )
+
+            def boom(url: str, timeout: float):
+                raise ConnectionError("feed down")
+
+            cal = EventCalendar(fetcher=boom, fallback_path=path, warn_hours=12)
+            cal.check(FOMC_MS)
+            self.assertEqual(cal.source, "fallback")
+            self.assertIn("2026-10-28", cal.month_events(2026, 10))
+            self.assertEqual(cal.source, "fallback")
+
+    def test_recovery_flips_back_to_live(self):
+        calls = {"n": 0}
+
+        def flaky(url: str, timeout: float):
+            calls["n"] += 1
+            if calls["n"] <= 3:
+                raise ConnectionError("down")
+            return next_payload({"fomc": FOMC_ISO, "cpi": FOMC_ISO, "nfp": FOMC_ISO})(
+                url, timeout
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "fallback.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"events": []}, handle)
+            cal = EventCalendar(fetcher=flaky, fallback_path=path, warn_hours=12)
+            cal.refresh(FOMC_MS, force=True)
+            self.assertEqual(cal.source, "none")
+            cal.refresh(FOMC_MS, force=True)
+            self.assertEqual(cal.source, "live")
+
+
 # ── N6/N8: web endpoints + static UI ────────────────────────────────────
 
 
@@ -813,6 +878,7 @@ class TestWebEvents(unittest.TestCase):
         )
         self.assertTrue(by_series["fomc"]["trading_paused"])
         self.assertIn("event_vn", by_series["fomc"])
+        self.assertEqual(payload["source"], "live")
 
     def test_events_calendar_endpoint(self):
         status, payload = self._get("/api/events/calendar?month=2026-10")
@@ -822,11 +888,28 @@ class TestWebEvents(unittest.TestCase):
         fomc = payload["days"]["2026-10-28"][0]
         self.assertTrue(fomc["trading_paused"])
         self.assertIn("financecalendar.com", payload["attribution"])
+        self.assertEqual(payload["source"], "live")
 
     def test_events_calendar_bad_month_falls_back(self):
         status, payload = self._get("/api/events/calendar?month=nope")
         self.assertEqual(status, 200)
         self.assertIn("days", payload)
+
+    def test_fallback_source_reported(self):
+        def boom(url: str, timeout: float):
+            raise ConnectionError("feed down")
+
+        app = WebApplication(
+            self.db,
+            event_calendar=EventCalendar(
+                fetcher=boom, fallback_path="/nonexistent/ev.json", warn_hours=12
+            ),
+        )
+        payload = app.events()
+        self.assertEqual(payload["source"], "none")
+        month = app.events_calendar("2026-10")
+        self.assertEqual(month["source"], "fallback")
+        self.assertEqual(month["days"], {})
 
     def test_static_markers(self):
         def raw(path: str) -> str:
@@ -840,6 +923,7 @@ class TestWebEvents(unittest.TestCase):
             'id="calGrid"',
             'id="eventDialog"',
             'id="eventsBtn"',
+            'id="calSource"',
             'data-panel="events"',
             "financecalendar.com",
         ):
@@ -850,6 +934,8 @@ class TestWebEvents(unittest.TestCase):
             "loadEvents",
             "renderEventsCalendar",
             "openEventDialog",
+            "shortEventName",
+            "calSource",
             "/api/events/calendar",
             '"events"',
         ):
@@ -862,8 +948,50 @@ class TestWebEvents(unittest.TestCase):
             ".cal-chip",
             ".event-dialog",
             ".badge.event-blackout",
+            "minmax(0, 1fr)",
+            "min-width: 0",
         ):
             self.assertIn(marker, css)
+
+    def test_short_event_name(self):
+        import shutil
+        import subprocess
+
+        if shutil.which("node") is None:
+            self.skipTest("node is not installed")
+        with self._urllib.urlopen(self.base + "/static/app.js", timeout=10) as resp:
+            source = resp.read().decode("utf-8")
+        start = source.index("function shortEventName(")
+        depth = 0
+        for pos in range(start, len(source)):
+            if source[pos] == "{":
+                depth += 1
+            elif source[pos] == "}":
+                depth -= 1
+                if depth == 0:
+                    fn = source[start : pos + 1]
+                    break
+        program = (
+            fn + "\nconsole.log(JSON.stringify(["
+            "shortEventName('FOMC Rate Decision October 2026'),"
+            "shortEventName('US Employment Situation (Non-Farm Payrolls) October 2026'),"
+            "shortEventName('CPI'),"
+            "]));"
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as handle:
+            handle.write(program)
+            path = handle.name
+        try:
+            proc = subprocess.run(
+                ["node", path], capture_output=True, text=True, timeout=60
+            )
+        finally:
+            os.unlink(path)
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr[-1000:])
+        short, clipped, tiny = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertEqual(short, "FOMC Rate Decision")
+        self.assertTrue(len(clipped) <= 22 and clipped.endswith("…"))
+        self.assertEqual(tiny, "CPI")
 
 
 if __name__ == "__main__":

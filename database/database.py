@@ -312,6 +312,7 @@ _SCHEMA_TABLES: tuple[str, ...] = (
         prompt_tokens INTEGER,
         completion_tokens INTEGER,
         total_tokens INTEGER,
+        tokens_estimated INTEGER,
         UNIQUE (symbol, timeframe, candle_timestamp_ms)
     )
     """,
@@ -361,6 +362,9 @@ _ADDITIVE_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("candle_log", "prompt_tokens", "INTEGER"),
     ("candle_log", "completion_tokens", "INTEGER"),
     ("candle_log", "total_tokens", "INTEGER"),
+    # Tokens fix: whether the counts are a ~4-chars/token estimate (1) or a
+    # metered provider count (0). UI prefixes estimates with "~".
+    ("candle_log", "tokens_estimated", "INTEGER"),
 )
 
 _TRANSITION_COLUMNS = ("created_at", "opened_at", "closed_at")
@@ -1603,6 +1607,7 @@ class CandleLogEntry:
         "prompt_tokens",
         "completion_tokens",
         "total_tokens",
+        "tokens_estimated",
     )
 
     def __init__(
@@ -1632,6 +1637,7 @@ class CandleLogEntry:
         prompt_tokens: int | None,
         completion_tokens: int | None,
         total_tokens: int | None,
+        tokens_estimated: int | None = None,
     ) -> None:
         self.id = id
         self.symbol = symbol
@@ -1657,6 +1663,7 @@ class CandleLogEntry:
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
         self.total_tokens = total_tokens
+        self.tokens_estimated = tokens_estimated
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> CandleLogEntry:
@@ -1685,6 +1692,7 @@ class CandleLogEntry:
             prompt_tokens=row["prompt_tokens"],
             completion_tokens=row["completion_tokens"],
             total_tokens=row["total_tokens"],
+            tokens_estimated=row["tokens_estimated"],
         )
 
 
@@ -1726,6 +1734,7 @@ class CandleLogRepository:
         prompt_tokens: int | None = None,
         completion_tokens: int | None = None,
         total_tokens: int | None = None,
+        tokens_estimated: bool = False,
     ) -> None:
         """Insert or replace the diagnostic row for one candle.
 
@@ -1733,7 +1742,8 @@ class CandleLogRepository:
         ``decision`` is one of LONG/SHORT/WAIT/NONE for validated rows.
         Quota counters (``llm_calls`` etc.) must be non-negative integers;
         token counts are best-effort and stay NULL when the provider path
-        drops the usage metadata.
+        drops the usage metadata. ``tokens_estimated`` marks ~4-chars/token
+        estimates (stored 1) versus metered counts (0).
         """
         if not isinstance(candle_timestamp_ms, int) or candle_timestamp_ms <= 0:
             raise SignalValidationError(
@@ -1777,8 +1787,9 @@ class CandleLogRepository:
                     recorded_at, outcome, decision, confidence, entry,
                     stop_loss, take_profit, close_price, signal_id, provider,
                     model, temperature, reasoning, error_notes, indicators_json,
-                    llm_calls, prompt_tokens, completion_tokens, total_tokens
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    llm_calls, prompt_tokens, completion_tokens, total_tokens,
+                    tokens_estimated
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(symbol, timeframe, candle_timestamp_ms)
                 DO UPDATE SET
                     closed_at = excluded.closed_at,
@@ -1800,7 +1811,8 @@ class CandleLogRepository:
                     llm_calls = excluded.llm_calls,
                     prompt_tokens = excluded.prompt_tokens,
                     completion_tokens = excluded.completion_tokens,
-                    total_tokens = excluded.total_tokens
+                    total_tokens = excluded.total_tokens,
+                    tokens_estimated = excluded.tokens_estimated
                 """,
                 (
                     validate_symbol(symbol),
@@ -1826,6 +1838,7 @@ class CandleLogRepository:
                     quota["prompt_tokens"],
                     quota["completion_tokens"],
                     quota["total_tokens"],
+                    1 if tokens_estimated else 0,
                 ),
             )
             conn.execute(

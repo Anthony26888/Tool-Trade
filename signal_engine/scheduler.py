@@ -1014,6 +1014,7 @@ class OneHourScheduler:
         closed_at = None
         llm_calls = 0
         prompt_tokens = completion_tokens = total_tokens = None
+        tokens_estimated = False
         if analysis is not None:
             decision = analysis.decision
             confidence = None
@@ -1035,6 +1036,7 @@ class OneHourScheduler:
             prompt_tokens = analysis.prompt_tokens
             completion_tokens = analysis.completion_tokens
             total_tokens = analysis.total_tokens
+            tokens_estimated = bool(analysis.tokens_estimated)
         else:
             decision = "NONE"
         if closed_at is None:
@@ -1064,6 +1066,7 @@ class OneHourScheduler:
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 total_tokens=total_tokens,
+                tokens_estimated=tokens_estimated,
             )
         except Exception as exc:  # pragma: no cover - defensive boundary
             logger.warning("[Scheduler] candle-log write failed: %s", exc)

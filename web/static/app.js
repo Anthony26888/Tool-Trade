@@ -192,7 +192,7 @@ function drawPriceChart(canvas, chart, view) {
   if (!total) { $("#chartMsg").textContent = "No candle data yet."; return; }
   $("#chartMsg").textContent = "";
 
-  const end = total - (view ? view.back : 0);
+  const end = total - (view ? view.backFromNewest : 0);
   const start = Math.max(0, end - (view ? view.count : total));
   const candles = allCandles.slice(start, end);
   const n = candles.length;
@@ -307,21 +307,21 @@ function drawPriceChart(canvas, chart, view) {
 
 let chartView = null;
 let lastChart = null;
-const CHART_WINDOW_DEFAULT = 160;
+const CHART_WINDOW_DEFAULT = 50;
 const CHART_WINDOW_MIN = 15;
 
 function clampView(n) {
   const stored = chartView || { count: Math.min(CHART_WINDOW_DEFAULT, n), backFromNewest: 0 };
   const count = Math.max(CHART_WINDOW_MIN, Math.min(stored.count, n));
-  const back = Math.max(0, Math.min(stored.backFromNewest, n - count));
-  return { count, back };
+  const backFromNewest = Math.max(0, Math.min(stored.backFromNewest, n - count));
+  return { count, backFromNewest };
 }
 
 function updateChartRange(view, candles) {
   const el = $("#chartRange");
   if (!el) return;
   const n = candles.length;
-  const endC = n - view.back;
+  const endC = n - view.backFromNewest;
   const start = Math.max(0, endC - view.count);
   if (start === 0 && endC === n) {
     el.textContent = "all · " + n + " candles";
@@ -343,9 +343,13 @@ function zoomChart(factor) {
   if (!lastChart || !lastChart.candles.length) return;
   const n = lastChart.candles.length;
   const cur = clampView(n);
+  // Keep the current pan position: zooming where you look. At the newest
+  // candle (backFromNewest 0) this stays glued to the latest candle; in the
+  // past it zooms in place instead of jumping back to newest.
+  const count = Math.max(CHART_WINDOW_MIN, Math.min(Math.round(cur.count * factor), n));
   chartView = {
-    count: Math.max(CHART_WINDOW_MIN, Math.min(Math.round(cur.count * factor), n)),
-    backFromNewest: 0,
+    count,
+    backFromNewest: Math.max(0, Math.min(cur.backFromNewest, n - count)),
   };
   redrawChart();
 }
@@ -357,7 +361,7 @@ function panChart(direction) {
   const step = Math.max(1, Math.round(cur.count * 0.2));
   chartView = {
     count: cur.count,
-    backFromNewest: Math.max(0, Math.min(cur.back + direction * step, n - cur.count)),
+    backFromNewest: Math.max(0, Math.min(cur.backFromNewest + direction * step, n - cur.count)),
   };
   redrawChart();
 }
@@ -367,13 +371,13 @@ function resetChart() {
   redrawChart();
 }
 
-const chartPad = { left: 62, right: 8 };
+const chartPad = { left: 8, right: 60 };
 let chartDrag = null;
 
 $("#priceChart").addEventListener("mousedown", (e) => {
   if (!lastChart || !lastChart.candles.length) return;
   const cur = clampView(lastChart.candles.length);
-  chartDrag = { x: e.clientX, back: cur.back, count: cur.count };
+  chartDrag = { x: e.clientX, back: cur.backFromNewest, count: cur.count };
   e.currentTarget.classList.add("dragging");
   e.preventDefault();
 });
@@ -632,9 +636,6 @@ function renderDaemonTable(list) {
     const notes = (e.error_notes || "") ? `<span class="note-cell">${escapeHtml(truncate(e.error_notes, 60))}</span>` : "—";
     const res = `$${fmtNum(e.close_price, 2)}`;
     const calls = (e.llm_calls === null || e.llm_calls === undefined) ? "—" : e.llm_calls;
-    const tokens = [e.prompt_tokens, e.completion_tokens, e.total_tokens].every((v) => v === null || v === undefined)
-      ? ""
-      : `<div class="kv"><span>tokens in / out / total</span><span>${e.prompt_tokens ?? "—"} / ${e.completion_tokens ?? "—"} / ${e.total_tokens ?? "—"}</span></div>`;
     return `<tr class="dd-row" data-row="${e.id}">
       <td data-label="Recorded">${fmtVn(e.recorded_at)}</td>
       <td data-label="Candle close (VN)">${fmtVnMs(e.candle_timestamp_ms)}</td>
@@ -649,12 +650,11 @@ function renderDaemonTable(list) {
     </tr>
     <tr class="dd-detail" id="dd-detail-${e.id}" hidden><td colspan="10">
       <div class="dd-detail-box">
-        <div class="kv"><span>entry / SL / TP</span><span>$${fmtNum(e.entry, 2)} / $${fmtNum(e.stop_loss, 2)} / $${fmtNum(e.take_profit, 2)}</span></div>
-        <div class="kv"><span>LLM calls</span><span>${calls}</span></div>
-        ${tokens}
-        ${Object.entries(e.indicators || {}).map(([k, val]) => `<span class="indc">${k}=${fmtNum(val, 4)}</span>`).join("")}
-        ${e.reasoning ? `<div class="dd-reason">${escapeHtml(e.reasoning)}</div>` : ""}
-        ${e.error_notes ? `<div class="dd-reason err">${escapeHtml(e.error_notes)}</div>` : ""}
+        ${ddLevelsSection(e)}
+        ${ddQuotaSection(e)}
+        ${ddIndicatorsSection(e)}
+        ${e.reasoning ? `<div class="dd-sec"><div class="dd-sec-title">Nhận định AI</div><div class="dd-reason">${escapeHtml(e.reasoning)}</div></div>` : ""}
+        ${e.error_notes ? `<div class="dd-sec"><div class="dd-sec-title">Lỗi</div><div class="dd-reason err">${escapeHtml(e.error_notes)}</div></div>` : ""}
       </div>
     </td></tr>`;
   }).join("");
@@ -665,25 +665,113 @@ function truncate(text, n) {
   return String(text).length > n ? String(text).slice(0, n) + "…" : String(text);
 }
 
+const DD_IND_GROUPS = [
+  ["Trend", ["ema20", "ema50", "ema200"]],
+  ["Momentum", ["rsi14", "macd", "macd_signal", "macd_histogram"]],
+  ["Biến động", ["atr14", "bb_mid", "bb_upper", "bb_lower"]],
+  ["Sức trend", ["adx14", "adx_plus_di", "adx_minus_di"]],
+  ["Volume", ["volume_sma20", "volume_ratio"]],
+];
+
+function ddRiskReward(e) {
+  const toN = (v) => (v === null || v === undefined || v === "" ? null : Number(v));
+  const entry = toN(e.entry), sl = toN(e.stop_loss), tp = toN(e.take_profit);
+  if (![entry, sl, tp].every((v) => v !== null && Number.isFinite(v))) return "";
+  let rr = null;
+  if (e.decision === "LONG" && sl < entry && tp > entry) rr = (tp - entry) / (entry - sl);
+  if (e.decision === "SHORT" && sl > entry && tp < entry) rr = (entry - tp) / (sl - entry);
+  return rr === null ? "" : `RR ${fmtNum(rr, 2)}`;
+}
+
+function ddLevelsSection(e) {
+  if (e.decision !== "LONG" && e.decision !== "SHORT") {
+    return `<div class="dd-sec"><div class="dd-sec-title">Lệnh</div><div class="muted">${badge(e.decision || "WAIT")} — không tạo lệnh</div></div>`;
+  }
+  const rr = ddRiskReward(e);
+  return `<div class="dd-sec"><div class="dd-sec-title">Lệnh ${badge(e.decision)}${e.confidence !== null && e.confidence !== undefined ? ` · Conf ${fmtNum(e.confidence, 0)}` : ""}${rr ? ` · ${rr}` : ""}</div>
+    <div class="dd-levels">
+      <div class="dd-level"><span>Entry</span><strong>$${fmtNum(e.entry, 2)}</strong></div>
+      <div class="dd-level sl"><span>Stop Loss</span><strong>$${fmtNum(e.stop_loss, 2)}</strong></div>
+      <div class="dd-level tp"><span>Take Profit</span><strong>$${fmtNum(e.take_profit, 2)}</strong></div>
+    </div></div>`;
+}
+
+function ddQuotaSection(e) {
+  const hasTokens = [e.prompt_tokens, e.completion_tokens, e.total_tokens].some((v) => v !== null && v !== undefined);
+  const tilde = e.tokens_estimated ? "~" : "";
+  const tok = (v) => (v === null || v === undefined ? "—" : tilde + v);
+  return `<div class="dd-sec"><div class="dd-sec-title">AI &amp; Quota</div>
+    <div class="dd-stats">
+      <div class="dd-stat"><span>Model</span><strong>${escapeHtml(e.model || e.provider || "—")}</strong></div>
+      <div class="dd-stat"><span>Temp</span><strong>${e.temperature ?? "—"}</strong></div>
+      <div class="dd-stat"><span>LLM calls</span><strong>${e.llm_calls ?? "—"}</strong></div>
+      <div class="dd-stat" title="${e.tokens_estimated ? "Ước tính (~4 ký tự/token), không phải số đo thật" : "Số đo thật từ provider"}"><span>Tokens in/out/total${e.tokens_estimated ? " (~)" : ""}</span><strong>${hasTokens ? `${tok(e.prompt_tokens)} / ${tok(e.completion_tokens)} / ${tok(e.total_tokens)}` : "—"}</strong></div>
+    </div></div>`;
+}
+
+function ddIndicatorsSection(e) {
+  const ind = e.indicators || {};
+  const groups = DD_IND_GROUPS.map(([label, keys]) => {
+    const cells = keys.filter((k) => ind[k] !== null && ind[k] !== undefined && ind[k] !== "")
+      .map((k) => `<div class="kv"><span>${k}</span><span>${fmtNum(ind[k], 2)}</span></div>`).join("");
+    return cells ? `<div class="dd-ind-group"><div class="dd-ind-title">${label}</div>${cells}</div>` : "";
+  }).join("");
+  if (!groups) return "";
+  return `<div class="dd-sec"><div class="dd-sec-title">Chỉ báo</div><div class="dd-ind-grid">${groups}</div></div>`;
+}
+
+const DD_PAGE_SIZE = 50;
+let ddPage = 0;
+
 async function loadDaemonLog() {
-  const p = new URLSearchParams({ limit: "500" });
+  const p = new URLSearchParams({ limit: String(DD_PAGE_SIZE + 1), offset: String(ddPage * DD_PAGE_SIZE) });
   const dir = $("#ddDir").value;
   const range = daemonTimeRange();
   if (dir) p.set("decision", dir);
   if (range) p.set("since", range.since);
   const data = await api("/api/daemon-log?" + p.toString());
-  $("#daemonTable").innerHTML = renderDaemonTable(data.rows || []);
+  const rows = data.rows || [];
+  $("#daemonTable").innerHTML = renderDaemonTable(rows.slice(0, DD_PAGE_SIZE));
+  renderDaemonPager(rows.length > DD_PAGE_SIZE);
 }
+
+function renderDaemonPager(hasMore) {
+  const el = $("#daemonPager");
+  if (!el) return;
+  if (ddPage === 0 && !hasMore) {
+    el.hidden = true;
+    el.innerHTML = "";
+    return;
+  }
+  const from = ddPage * DD_PAGE_SIZE + 1;
+  el.hidden = false;
+  el.innerHTML =
+    `<button type="button" class="btn secondary" data-pg="prev"${ddPage === 0 ? " disabled" : ""}>‹ Trước</button>` +
+    `<span class="pager-label">Trang ${ddPage + 1} · dòng ${from}+</span>` +
+    `<button type="button" class="btn secondary" data-pg="next"${hasMore ? "" : " disabled"}>Sau ›</button>`;
+}
+
+$("#daemonPager").addEventListener("click", (ev) => {
+  const btn = ev.target.closest("[data-pg]");
+  if (!btn || btn.disabled) return;
+  ddPage = btn.dataset.pg === "next" ? ddPage + 1 : Math.max(0, ddPage - 1);
+  showLoader();
+  loadDaemonLog().catch((e) => toast(e.message, "error")).finally(hideLoader);
+});
 
 async function clearDaemonLog() {
   if (!confirm("Delete the entire daemon activity log? This only removes diagnostic rows, not signals/positions.")) return;
   const res = await api("/api/daemon-log", { method: "DELETE" });
   toast("Cleared " + (res.cleared || 0) + " log row(s)", "ok");
+  ddPage = 0;
   loadDaemonLog().catch((e) => toast(e.message, "error"));
 }
 
+const SIG_PAGE_SIZE = 25;
+let sigPage = 0;
+
 async function loadSignals() {
-  const p = new URLSearchParams({ limit: "500" });
+  const p = new URLSearchParams({ limit: String(SIG_PAGE_SIZE + 1), offset: String(sigPage * SIG_PAGE_SIZE) });
   const dir = $("#sigDir").value;
   const st = $("#sigStatus").value;
   if (dir) p.set("direction", dir);
@@ -694,10 +782,36 @@ async function loadSignals() {
     p.set("until", range.until);
   }
   const data = await api("/api/signals?" + p.toString());
-  $("#signalsTable").innerHTML = renderSignalTable(data.signals || []);
+  const list = data.signals || [];
+  $("#signalsTable").innerHTML = renderSignalTable(list.slice(0, SIG_PAGE_SIZE));
   $("#sigSelAll").textContent = "Select all";
   updateSigDeleteCount();
+  renderSignalsPager(list.length > SIG_PAGE_SIZE);
 }
+
+function renderSignalsPager(hasMore) {
+  const el = $("#signalsPager");
+  if (!el) return;
+  if (sigPage === 0 && !hasMore) {
+    el.hidden = true;
+    el.innerHTML = "";
+    return;
+  }
+  const from = sigPage * SIG_PAGE_SIZE + 1;
+  el.hidden = false;
+  el.innerHTML =
+    `<button type="button" class="btn secondary" data-pg="prev"${sigPage === 0 ? " disabled" : ""}>‹ Trước</button>` +
+    `<span class="pager-label">Trang ${sigPage + 1} · dòng ${from}+</span>` +
+    `<button type="button" class="btn secondary" data-pg="next"${hasMore ? "" : " disabled"}>Sau ›</button>`;
+}
+
+$("#signalsPager").addEventListener("click", (ev) => {
+  const btn = ev.target.closest("[data-pg]");
+  if (!btn || btn.disabled) return;
+  sigPage = btn.dataset.pg === "next" ? sigPage + 1 : Math.max(0, sigPage - 1);
+  showLoader();
+  loadSignals().catch((e) => toast(e.message, "error")).finally(hideLoader);
+});
 
 async function deleteSignals(body) {
   const res = await api("/api/signals", {
@@ -712,6 +826,10 @@ async function deleteSignals(body) {
     skipped ? "warn" : "ok"
   );
   await Promise.allSettled([loadSignals(), loadTrades(), loadStatistics()]);
+  if (sigPage > 0 && !document.querySelector("#signalsTable tbody tr")) {
+    sigPage -= 1;
+    await loadSignals().catch((e) => toast(e.message, "error"));
+  }
 }
 
 async function loadTrades() {
@@ -1048,10 +1166,13 @@ async function loadEventBanner() {
   }
   const active = data && data.active;
   const upcoming = (data && data.upcoming) || [];
+  const srcNote = data && data.source === "fallback"
+    ? " (lịch dự phòng — chỉ có FOMC, kiểm tra mạng tới financecalendar.com)"
+    : "";
   if (active) {
     el.hidden = false;
     el.className = "event-banner active";
-    el.title = (active.title || "") + " — " + (active.event_utc || "");
+    el.title = (active.title || "") + " — " + (active.event_utc || "") + srcNote;
     el.textContent = `⏸ BLACKOUT: ${active.title} — AI nghỉ đến ${active.blackout_end_vn}`;
     return;
   }
@@ -1061,7 +1182,7 @@ async function loadEventBanner() {
     const when = mins >= 90 ? `sau ~${Math.round(mins / 60)}h` : `sau ${mins}p`;
     el.hidden = false;
     el.className = "event-banner upcoming";
-    el.title = (next.title || "") + " — " + (next.event_utc || "");
+    el.title = (next.title || "") + " — " + (next.event_utc || "") + srcNote;
     el.textContent = `⚠️ ${next.title} ${when} — ngừng mở lệnh từ ${next.blackout_start_vn}`;
     return;
   }
@@ -1074,6 +1195,14 @@ let eventsMonth = null; // "YYYY-MM", null = current month
 let eventsDays = {};
 
 const VN_MONTHS = ["Tháng 1", "Tháng 2", "Tháng 3", "Tháng 4", "Tháng 5", "Tháng 6", "Tháng 7", "Tháng 8", "Tháng 9", "Tháng 10", "Tháng 11", "Tháng 12"];
+
+// Short label for calendar chips: strip the trailing " Month YYYY" the feed
+// appends and cap length so one long title can never stretch the grid
+// (CSS ellipsis is the primary guard; this is belt-and-braces).
+function shortEventName(name) {
+  const s = String(name || "?").replace(/\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}\s*$/, "");
+  return s.length > 22 ? s.slice(0, 21) + "…" : s;
+}
 
 function shiftMonth(key, delta) {
   const [y, m] = key.split("-").map(Number);
@@ -1091,6 +1220,15 @@ async function loadEvents() {
   const data = await api("/api/events/calendar?month=" + encodeURIComponent(eventsMonth));
   eventsMonth = data.month || eventsMonth;
   eventsDays = (data && data.days) || {};
+  const srcEl = $("#calSource");
+  if (srcEl) {
+    srcEl.textContent = data && data.source === "fallback"
+      ? "Nguồn: dự phòng (chỉ FOMC — kiểm tra mạng)"
+      : "Nguồn: trực tiếp";
+    srcEl.title = data && data.source === "fallback"
+      ? "Không với tới financecalendar.com, đang dùng file lịch tĩnh trong app"
+      : "Lịch trực tiếp từ financecalendar.com";
+  }
   renderEventsCalendar();
 }
 
@@ -1116,7 +1254,7 @@ function renderEventsCalendar() {
       const imp = String(e.impact || "").toLowerCase() === "high" ? "imp-high" : (String(e.impact || "").toLowerCase() === "medium" ? "imp-medium" : "imp-low");
       const mark = e.trading_paused ? "⏸ " : "";
       const paused = e.trading_paused ? " paused" : "";
-      return `<span class="cal-chip ${imp}${paused}">${mark}${escapeHtml(String(e.name || "?"))}</span>`;
+      return `<span class="cal-chip ${imp}${paused}" title="${escapeHtml(String(e.title || e.name || "?"))}">${mark}${escapeHtml(shortEventName(e.name))}</span>`;
     }).join("");
     const more = list.length > 2 ? `<span class="cal-more">+${list.length - 2}</span>` : "";
     const dayPaused = list.some((e) => e.trading_paused);
@@ -1205,7 +1343,7 @@ setInterval(() => { if (current === "dashboard") refresh("dashboard"); loadEvent
 $("#chartInterval").addEventListener("change", () => { chartView = null; loadChart(); });
 
 ["sigDir", "sigStatus", "sigTime"].forEach((id) => {
-  $("#" + id).addEventListener("change", () => loadSignals().catch((e) => toast(e.message, "error")));
+  $("#" + id).addEventListener("change", () => { sigPage = 0; loadSignals().catch((e) => toast(e.message, "error")); });
 });
 
 $("#signalsTable").addEventListener("change", (ev) => {
@@ -1234,7 +1372,7 @@ $("#sigDeleteAll").addEventListener("click", async () => {
 });
 
 ["ddDir", "ddTime"].forEach((id) => {
-  $("#" + id).addEventListener("change", () => loadDaemonLog().catch((e) => toast(e.message, "error")));
+  $("#" + id).addEventListener("change", () => { ddPage = 0; loadDaemonLog().catch((e) => toast(e.message, "error")); });
 });
 
 $("#ddClear").addEventListener("click", () => clearDaemonLog().catch((e) => toast(e.message, "error")));

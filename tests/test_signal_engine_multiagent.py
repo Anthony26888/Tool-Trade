@@ -323,9 +323,64 @@ class TestMultiAgentAnalyzer(unittest.TestCase):
             self.candles, self.indicators
         )
         self.assertEqual(analysis.llm_calls, 5)
-        # Structured path drops the envelope: token counts stay NULL.
-        self.assertIsNone(analysis.prompt_tokens)
-        self.assertIsNone(analysis.total_tokens)
+        # Parsed-only test doubles carry no usage metadata: counts are
+        # ~4-chars/token estimates, always flagged.
+        self.assertTrue(analysis.tokens_estimated)
+        self.assertGreater(analysis.prompt_tokens, 0)
+        self.assertGreater(analysis.total_tokens, 0)
+
+    def test_full_debate_metered_via_include_raw(self):
+        results = _long_results()
+        order = list(_ROLE_ORDER)
+        plain_calls: list = []
+        raw_calls: list = []
+
+        def _usage(role):
+            return SimpleNamespace(
+                usage_metadata={
+                    "input_tokens": 100,
+                    "output_tokens": 20,
+                    "total_tokens": 120,
+                }
+            )
+
+        llm = MagicMock()
+        plain_by_role: dict = {}
+        raw_by_role: dict = {}
+
+        def _bind(schema, **kwargs):
+            if kwargs.get("include_raw"):
+                role = order[len(raw_by_role)]
+                mock = MagicMock()
+                mock.invoke.side_effect = lambda prompt, _r=role: (
+                    raw_calls.append(_r),
+                    {
+                        "parsed": results[_r],
+                        "raw": _usage(_r),
+                        "parsing_error": None,
+                    },
+                )[1]
+                raw_by_role[role] = mock
+                return mock
+            role = order[len(plain_by_role)]
+            mock = MagicMock()
+            mock.invoke.side_effect = lambda prompt, _r=role: (
+                plain_calls.append(_r),
+                results[_r],
+            )[1]
+            plain_by_role[role] = mock
+            return mock
+
+        llm.with_structured_output.side_effect = _bind
+        analysis = MultiAgentSignalAnalyzer(CONFIG, llm=llm).analyze(
+            self.candles, self.indicators
+        )
+        self.assertEqual(analysis.llm_calls, 5)
+        self.assertFalse(analysis.tokens_estimated)
+        self.assertEqual(analysis.prompt_tokens, 500)
+        self.assertEqual(analysis.completion_tokens, 100)
+        self.assertEqual(analysis.total_tokens, 600)
+        self.assertEqual(plain_calls, [])
 
     def test_structured_fallback_parses_strict_json(self):
         payloads = [
@@ -380,13 +435,20 @@ class TestAnalyzeSignalMode(unittest.TestCase):
     def test_mode_single_keeps_single_invoke(self):
         llm = MagicMock()
         structured = MagicMock()
-        llm.with_structured_output.return_value = structured
+        raw_structured = MagicMock()
+
+        def _bind(schema, **kwargs):
+            return raw_structured if kwargs.get("include_raw") else structured
+
+        llm.with_structured_output.side_effect = _bind
         structured.invoke.return_value = _decision_payload()
         analysis = analyze_signal(
             CONFIG, self.candles, self.indicators, llm=llm, mode="single"
         )
         self.assertEqual(analysis.decision, "LONG")
-        llm.with_structured_output.assert_called_once()
+        # Both bindings attempted; the raw envelope is unavailable on this
+        # double, so exactly one parsed-only invoke runs the analysis.
+        self.assertEqual(llm.with_structured_output.call_count, 2)
         structured.invoke.assert_called_once()
 
     def test_unknown_mode_falls_back_to_single(self):
