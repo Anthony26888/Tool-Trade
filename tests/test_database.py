@@ -723,9 +723,6 @@ class TestSignalsDelete(DatabaseTestCase):
             net_pnl=Decimal("4.80"),
             pnl_percent=Decimal("0.96"),
             result="WIN" if not short else "LOSS",
-            next_balance=Decimal("1004.80"),
-            next_equity=Decimal("1004.80"),
-            next_peak_equity=Decimal("1004.80"),
         )
         return sig.id
 

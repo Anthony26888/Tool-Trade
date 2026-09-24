@@ -319,7 +319,7 @@ class Runtime:
             scheduler = OneHourScheduler(
                 repo,
                 market_data=market,
-                symbol=self._resolving_symbol,
+                symbol=self._resolving_daemon_symbol(),
                 timeframe=self.config.timeframe,
                 config=self.llm_env_config(),
                 analyzer=self._resolving_analyzer(),
@@ -333,6 +333,7 @@ class Runtime:
                 market_data=market,
                 candle_limit=DEFAULT_CANDLE_LIMIT,
                 notifier=None,
+                symbol=self._resolving_daemon_symbol(),
             )
         self.repository = repo
         self.scheduler = scheduler
@@ -373,6 +374,26 @@ class Runtime:
         except Exception:  # pragma: no cover - best-effort fallback
             return self.config.symbol
 
+    def _resolving_daemon_symbol(self):
+        """The symbol THIS daemon process analyses (plan B').
+
+        Returns a zero-argument callable resolving fresh per tick/poll via
+        ``ConfigService.resolve_daemon_symbol``: single-symbol deployments
+        behave exactly as before; a stored multi combo hands authority to the
+        per-process env symbol so N daemons on one shared DB analyse N
+        distinct symbols.
+        """
+        service = self.config_service
+        fallback = self.config.symbol
+
+        def resolve() -> str:
+            try:
+                return service.resolve_daemon_symbol()
+            except Exception:  # pragma: no cover - best-effort fallback
+                return fallback
+
+        return resolve
+
     def _resolving_analyzer(self):
         """An analyzer that resolves the LLM config per analysis (DB > env).
 
@@ -411,7 +432,7 @@ class Runtime:
             self.config_service.apply_pending_if_idle()
         except Exception as exc:  # pragma: no cover - best-effort
             logger.warning("[Runtime] pending config promotion failed: %s", exc)
-        result = self.recovery.recover()
+        result = self.recovery.recover(symbol=self._resolving_daemon_symbol()())
         if not self._started:
             self.executor.reconcile(active_signal=result.signal)
             self._started = True

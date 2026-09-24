@@ -82,12 +82,13 @@ Safety
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from binance.market_data import BinanceError, BinanceMarketData
+from binance.market_data import BinanceError, BinanceMarketData, validate_symbol
 from database.database import SignalRepository
 from database.models import (
     DIRECTION_LONG,
@@ -301,6 +302,7 @@ class SignalMonitor:
         *,
         candle_limit: int = DEFAULT_CANDLE_LIMIT,
         notifier: TelegramNotifier | None = None,
+        symbol: str | Callable[[], str] | None = None,
     ) -> None:
         if not isinstance(candle_limit, int) or candle_limit <= 0:
             raise ValueError("candle_limit must be a positive integer")
@@ -308,10 +310,38 @@ class SignalMonitor:
         self.market_data = BinanceMarketData() if market_data is None else market_data
         self.candle_limit = candle_limit
         self.notifier = notifier
+        #: Which symbol this monitor owns. ``None`` keeps the legacy global
+        #: behavior (single-symbol deployments, all existing tests). A plain
+        #: string is validated now; a callable is resolved on every poll so a
+        #: Settings symbol switch applies without a restart (plan B').
+        if symbol is None or callable(symbol):
+            self._symbol_source = symbol
+        else:
+            self._symbol_source = validate_symbol(symbol)
+
+    def _symbol(self) -> str | None:
+        """Resolve the owned symbol (None = legacy global scope)."""
+        source = self._symbol_source
+        if source is None:
+            return None
+        if callable(source):
+            return validate_symbol(source())
+        return source
+
+    def _active(self):
+        """Read the owned active signal (None = idle)."""
+        symbol = self._symbol()
+        if symbol is None:
+            return self.repository.get_active_signal()
+        return self.repository.get_active_signal_for_symbol(symbol)
 
     def poll(self, *, now_ms: int | None = None) -> MonitorResult:
         """Check the active signal against the latest closed 1m candle."""
-        active = self.repository.get_active_signal()
+        try:
+            active = self._active()
+        except Exception as exc:
+            logger.warning("[Monitor] symbol resolution failed: %s", exc)
+            return MonitorResult.no_active_signal()
         if active is None:
             # Idle: no fetch, no LLM, no signal creation — the critical rule.
             return MonitorResult.no_active_signal()
@@ -394,7 +424,9 @@ class SignalMonitor:
         except InvalidTransitionError as exc:
             # A concurrent poll already promoted (or closed) the signal. Never
             # create a second position: re-read and observe the changed state.
-            current = self.repository.get_active_signal()
+            # Scoped to this signal's own symbol so a sibling symbol's
+            # position is never mistaken for this one (plan B').
+            current = self.repository.get_active_signal_for_symbol(signal.symbol)
             if current is None:
                 return MonitorResult.no_active_signal()
             if current.status == STATUS_OPEN:
@@ -428,7 +460,8 @@ class SignalMonitor:
         except InvalidTransitionError as exc:
             # A concurrent poll already closed the signal into a terminal
             # state. Never overwrite it: if nothing is OPEN now we are done.
-            if self.repository.get_open_signal() is None:
+            # Scoped to this signal's own symbol (plan B').
+            if self.repository.get_open_signal_for_symbol(signal.symbol) is None:
                 return MonitorResult.no_active_signal()
             return MonitorResult.error(f"could not close signal {signal.id}: {exc}")
         except SignalNotFoundError:

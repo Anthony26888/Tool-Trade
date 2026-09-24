@@ -14,6 +14,8 @@ JSON API (all responses are ``application/json`` with ``ok`` envelope):
                                             -> signal ledger history (filters optional)
     GET  /api/daemon-log?limit=100&offset=&decision= -> per-candle daemon activity
                                             log (why LONG/SHORT/WAIT/locked/error)
+    GET  /api/quota?range=today|7d|30d|all -> LLM calls/tokens totals + per-day
+                                            breakdown (Vietnam wall-clock)
     GET  /api/trades?limit=50       -> demo trade ledger (immutable)
     GET  /api/statistics            -> win-rate / drawdown / fees / equity
     GET  /api/settings              -> masked settings + audit (NO secrets)
@@ -29,6 +31,9 @@ JSON API (all responses are ``application/json`` with ``ok`` envelope):
                                        {"all":true}; OPEN signals never deleted;
                                        linked positions/trades cascade
     DELETE /api/daemon-log          -> clear the per-candle daemon activity log
+    POST /api/positions/:id/close   -> manually close an OPEN signal at market
+                                       price (TP_HIT/SL_HIT by PnL sign,
+                                       close_reason=MANUAL)
     POST /api/signal-chat                   -> Stream (ndjson) chat about the
                                                active signal (read-only)
 
@@ -49,7 +54,7 @@ import threading
 import time
 import urllib.parse
 from collections.abc import Iterator
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -65,10 +70,20 @@ from database.database import (
     SignalRepository,
     SignalValidationError,
 )
+from database.models import (
+    DIRECTION_LONG,
+    STATUS_OPEN,
+    STATUS_SL_HIT,
+    STATUS_TP_HIT,
+    InvalidTransitionError,
+    SignalNotFoundError,
+)
+from demo.executor import DemoExecutor
 from demo.position import DemoAccountRecord, DemoPosition, DemoTrade
 from demo.scenario import tpsl_outcomes, unrealized_pnl
 from demo.statistics import demo_statistics
 from signal_engine.config import (
+    SUPPORTED_SYMBOLS,
     ConfigService,
     SettingsError,
     SettingsLockedError,
@@ -215,11 +230,13 @@ def _trade_json(trade) -> dict[str, Any]:
     return {
         "id": trade.id,
         "signal_id": trade.signal_id,
+        "symbol": trade.symbol,
         "side": trade.side,
         "entry_price": _jsonable(trade.entry_price),
         "exit_price": _jsonable(trade.exit_price),
         "quantity": _jsonable(trade.quantity),
         "position_size": _jsonable(trade.position_size),
+        "leverage": trade.leverage,
         "gross_pnl": _jsonable(trade.gross_pnl),
         "fee": _jsonable(trade.fee),
         "net_pnl": _jsonable(trade.net_pnl),
@@ -245,6 +262,7 @@ class WebApplication:
         market_data: BinanceMarketData | None = None,
         chat_responder=None,
         event_calendar: EventCalendar | None = None,
+        notifier=None,
     ) -> None:
         self.database = database
         self.config = config if config is not None else runtime_config_from_env()
@@ -269,6 +287,18 @@ class WebApplication:
         self._pos_cache: tuple[float, dict[str, Any]] | None = None
         self._chart_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._price_cache: tuple[str, float, Any] | None = None
+        #: Manual-close notifier (Signal channel). Defaults to a refreshable
+        #: notifier bound to stored Telegram settings so a manual "Chốt" posts
+        #: the same TP/SL lifecycle message the monitor posts. ``None`` resolver
+        #: degrades to a disabled notifier (tests / no Telegram configured).
+        if notifier is not None:
+            self.notifier = notifier
+        else:
+            from signal_engine.telegram import RefreshableTelegramNotifier
+
+            self.notifier = RefreshableTelegramNotifier(
+                getattr(self.config_service, "resolve_telegram_notifier", None)
+            )
 
     # -- Data ------------------------------------------------------------------
 
@@ -294,6 +324,83 @@ class WebApplication:
             fee_rate=config.fee_rate,
         )
         return DemoAccountRecord.from_row(row)
+
+    def close_position(self, signal_id: Any) -> dict[str, Any]:
+        """Manually close an OPEN signal at the current market price ("Chốt").
+
+        The close reuses the TP/SL path (no schema change): the signal lands on
+        TP_HIT when the exit is profitable, SL_HIT when it is a loss, with
+        ``close_reason="MANUAL"`` so the UI can tag it. A Telegram lifecycle
+        message goes to the Signal channel, same as a monitor close.
+        """
+        try:
+            sid = int(signal_id)
+        except (TypeError, ValueError) as exc:
+            raise SettingsValidationError(f"invalid signal id {signal_id!r}") from exc
+        try:
+            signal = self._signals.get_signal(sid)
+        except SignalNotFoundError as exc:
+            raise SettingsValidationError(f"no signal with id {sid}") from exc
+        if signal.status != STATUS_OPEN:
+            raise SettingsValidationError(
+                f"signal {sid} is {signal.status}; only OPEN signals can be closed manually"
+            )
+        if self._demo.get_position_for_signal(sid) is None:
+            raise SettingsValidationError(
+                f"signal {sid} has no demo position to close"
+            )
+        price = self._market_price(symbol=signal.symbol)
+        if price is None:
+            raise SettingsValidationError(
+                "market price unavailable; the position stays OPEN, try again"
+            )
+        entry = float(signal.entry)
+        profitable = price >= entry if signal.direction == DIRECTION_LONG else price <= entry
+        target = STATUS_TP_HIT if profitable else STATUS_SL_HIT
+        try:
+            closed = self._signals.transition_signal(
+                sid,
+                target,
+                close_price=price,
+                close_reason="MANUAL",
+                result="WIN" if profitable else "LOSS",
+            )
+        except InvalidTransitionError as exc:
+            raise SettingsValidationError(
+                f"signal {sid} was already closed (TP/SL hit first)"
+            ) from exc
+        stored = self.config_service.demo_config_object()
+        executor = DemoExecutor(
+            self.database,
+            config=stored if stored is not None else self.config.demo,
+        )
+        trade = executor.close_position(closed)
+        payload: dict[str, Any] = {
+            "id": sid,
+            "status": closed.status,
+            "close_price": float(closed.close_price) if closed.close_price is not None else None,
+            "close_reason": closed.close_reason,
+            "result": closed.result,
+        }
+        if trade is not None:
+            payload["trade"] = {
+                "net_pnl": float(trade.net_pnl),
+                "pnl_percent": float(trade.pnl_percent),
+                "exit_price": float(trade.exit_price),
+            }
+            account = executor.account()
+            balance = float(account.balance) if account is not None else None
+            payload["balance"] = balance
+            method = (
+                "notify_signal_tp" if target == STATUS_TP_HIT else "notify_signal_sl"
+            )
+            notify = getattr(self.notifier, method, None)
+            if notify is not None:
+                try:
+                    notify(closed, pnl=trade.net_pnl, balance=account.balance if account is not None else None)
+                except Exception:  # noqa: BLE001 - notify must never break a close
+                    logger.warning("[Web] manual-close Telegram notify failed", exc_info=True)
+        return payload
 
     def health(self) -> dict[str, Any]:
         snapshot = RuntimeStateRepository(self.database).snapshot()
@@ -326,6 +433,24 @@ class WebApplication:
         position_outcomes = (
             tpsl_outcomes(account, position) if position is not None else None
         )
+        positions = []
+        for sig in self._signals.list_active_signals():
+            sig_pos = None
+            pos_row = self._demo.get_position_for_signal(sig.id)
+            if pos_row is not None:
+                sig_pos = DemoPosition.from_row(pos_row)
+            sig_outcomes = (
+                tpsl_outcomes(account, sig_pos) if sig_pos is not None else None
+            )
+            positions.append(
+                {
+                    "signal": _signal_json(sig),
+                    "position": _position_json(sig_pos) if sig_pos is not None else None,
+                    "position_outcomes": sig_outcomes,
+                    "unrealized": self._live_unrealized(sig_pos),
+                }
+            )
+        portfolio = self._portfolio_status([item["signal"] for item in positions])
         return {
             "account": _account_json(account),
             "statistics": _decimal_stats(stats),
@@ -333,8 +458,51 @@ class WebApplication:
             "position": _position_json(position) if position is not None else None,
             "position_outcomes": position_outcomes,
             "unrealized": self._live_unrealized(position),
+            "positions": positions,
+            "portfolio": portfolio,
+            "symbols": self._dashboard_symbols(),
             "health": self.health(),
             "symbol": self.config_service.resolve_symbol(),
+        }
+
+    def _dashboard_symbols(self) -> list[str]:
+        """Enabled combo for the chart symbol select (never raises)."""
+        try:
+            symbols = self.config_service.get_symbols_public().get("symbols")
+            if isinstance(symbols, list) and symbols:
+                return [str(s) for s in symbols]
+        except Exception as exc:
+            logger.warning("[Web] dashboard symbols read failed: %s", exc)
+        return ["BTCUSDT"]
+
+    def _portfolio_status(self, signals: list[dict[str, Any]]) -> dict[str, Any]:
+        """Per-symbol portfolio state for the dashboard status line (plan B').
+
+        ``symbols`` mirrors the enabled Settings combo; each entry reports
+        ``OPEN``/``PENDING_ENTRY``/``SEEKING``. ``full`` is True when every
+        enabled symbol holds an active signal (analysis idle everywhere by
+        design, monitors still watching). Never raises.
+        """
+        try:
+            combo = self.config_service.get_symbols_public().get("symbols")
+            symbols = [s for s in combo if isinstance(s, str)] or ["BTCUSDT"]
+        except Exception as exc:
+            logger.warning("[Web] portfolio combo read failed: %s", exc)
+            symbols = ["BTCUSDT"]
+        by_symbol = {s.get("symbol"): s.get("status") for s in signals}
+        # Union with symbols actually holding positions: a deselected symbol
+        # with a blocked OPEN stop must stay visible, never vanish silently.
+        ordered = list(dict.fromkeys([*symbols, *by_symbol]))
+        entries = [
+            {
+                "symbol": symbol,
+                "state": by_symbol.get(symbol, "SEEKING"),
+            }
+            for symbol in ordered
+        ]
+        return {
+            "symbols": entries,
+            "full": bool(entries) and all(e["state"] != "SEEKING" for e in entries),
         }
 
     def _live_unrealized(self, position) -> dict[str, Any] | None:
@@ -526,10 +694,53 @@ class WebApplication:
         )
         return {"count": len(rows), "rows": [_candle_log_json(r) for r in rows]}
 
-    def clear_daemon_log(self) -> dict[str, Any]:
-        """Delete every candle-log row; returns how many were removed."""
+    def clear_daemon_log(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Delete candle-log rows: ``{"ids": [...]}`` for a selection, else all."""
+        body = payload if isinstance(payload, dict) else {}
+        ids = body.get("ids")
+        if isinstance(ids, list) and ids:
+            return {"deleted": self._candle_log.delete_rows(ids)}
         removed = self._candle_log.clear()
         return {"cleared": removed}
+
+    def quota(self, span: str | None = None) -> dict[str, Any]:
+        """LLM quota usage totals + per-day breakdown (read-only).
+
+        ``span`` is ``today``/``7d``/``30d``/``all`` in Vietnam wall-clock
+        (mirrors the Signals time filter); unknown values fall back to all.
+        Applies the stored per-request price (VND) as ``cost_vnd`` totals
+        (estimate basis, not the provider invoice). Never raises: failures
+        degrade to zeros.
+        """
+        try:
+            days_ago = {"today": 0, "7d": 6, "30d": 29}.get((span or "all").strip().lower())
+            since = None
+            if days_ago is not None:
+                now_vn = datetime.now(timezone.utc) + timedelta(hours=7)
+                start_vn = now_vn.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days_ago)
+                since = (start_vn - timedelta(hours=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            summary = self._candle_log.quota_summary(since)
+            summary["range"] = span if days_ago is not None else "all"
+            try:
+                price = float(
+                    self.config_service.get_quota_cost_public().get("per_call_vnd") or 0
+                )
+            except (TypeError, ValueError):
+                price = 0.0
+            summary["per_call_vnd"] = price
+            summary["cost_vnd"] = round(float(summary.get("llm_calls", 0)) * price, 2)
+            for day in summary.get("days", []):
+                if isinstance(day, dict):
+                    day["cost_vnd"] = round(float(day.get("llm_calls", 0)) * price, 2)
+            for row in summary.get("by_model", []):
+                if isinstance(row, dict):
+                    row["cost_vnd"] = round(float(row.get("llm_calls", 0)) * price, 2)
+            return summary
+        except Exception as exc:
+            logger.warning("[Web] quota summary failed: %s", exc)
+            return {"range": "all", "candles": 0, "llm_calls": 0,
+                    "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+                    "by_model": [], "days": []}
 
     def events(self) -> dict[str, Any]:
         """Phase N banner payload: active blackout + upcoming releases.
@@ -697,6 +908,12 @@ class WebApplication:
             self.config_service.update_demo(payload["demo"])
         if "telegram" in payload:
             self.config_service.update_telegram(payload["telegram"])
+        if "symbols" in payload:
+            self.config_service.update_symbols(payload["symbols"])
+        if "quota_cost" in payload:
+            self.config_service.update_quota_cost(payload["quota_cost"])
+        if "strategy" in payload:
+            self.config_service.update_strategy(payload["strategy"])
         if "symbol" in payload:
             self.config_service.update_symbol(payload["symbol"])
         return self.config_service.get_settings()
@@ -777,7 +994,16 @@ class _JsonHandler(BaseHTTPRequestHandler):
             elif path == "/api/chart":
                 interval = query.get("interval", ["1h"])[0]
                 limit = int(query.get("limit", ["160"])[0])
-                self._ok({"chart": self.app.chart(interval=interval, limit=limit)})
+                symbol = query.get("symbol", [""])[0] or None
+                if symbol is not None:
+                    normalized = symbol.strip().upper()
+                    if normalized not in SUPPORTED_SYMBOLS:
+                        raise SettingsValidationError(
+                            f"unsupported chart symbol {symbol!r}; "
+                            f"choose one of {', '.join(SUPPORTED_SYMBOLS)}"
+                        )
+                    symbol = normalized
+                self._ok({"chart": self.app.chart(interval=interval, limit=limit, symbol=symbol)})
             elif path == "/api/statistics":
                 self._ok(self.app.statistics())
             elif path == "/api/signals":
@@ -813,6 +1039,9 @@ class _JsonHandler(BaseHTTPRequestHandler):
                         decision=decision,
                     )
                 )
+            elif path == "/api/quota":
+                span = query.get("range", ["all"])[0]
+                self._ok(self.app.quota(span))
             elif path == "/api/events":
                 self._ok(self.app.events())
             elif path == "/api/events/calendar":
@@ -901,6 +1130,9 @@ class _JsonHandler(BaseHTTPRequestHandler):
                 self._ok(self.app.clear_last_error())
             elif parsed.path == "/api/signal-chat":
                 self._stream_signal_chat(self._read_body())
+            elif parsed.path.startswith("/api/positions/") and parsed.path.endswith("/close"):
+                signal_id = parsed.path[len("/api/positions/") : -len("/close")]
+                self._ok({"close": self.app.close_position(signal_id)})
             else:
                 self._json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
         except SettingsError as exc:
@@ -914,7 +1146,7 @@ class _JsonHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/signals":
                 self._ok(self.app.delete_signals(self._read_body()))
             elif parsed.path == "/api/daemon-log":
-                self._ok(self.app.clear_daemon_log())
+                self._ok(self.app.clear_daemon_log(self._read_body()))
             else:
                 self._json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
         except SettingsError as exc:

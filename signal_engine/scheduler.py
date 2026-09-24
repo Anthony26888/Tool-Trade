@@ -98,6 +98,7 @@ from .event_calendar import EventCalendar, EventCheck, format_vn
 from .llm import LLMConfig, llm_config_from_env
 from .multiagent import resolve_analysis_mode
 from .state import SignalState
+from .validator import read_stored_warn_hours
 
 if TYPE_CHECKING:  # pragma: no cover - type annotations only
     from .telegram import TelegramNotifier
@@ -533,7 +534,7 @@ class OneHourScheduler:
 
         # The AI lock: while PENDING_ENTRY or OPEN exists, never fetch for
         # analysis and never call the LLM (checked again by the engine later).
-        active = self.state.active_signal()
+        active = self.state.active_signal_for(self.symbol)
         if active is not None:
             logger.info(
                 "[Scheduler] blocked: active signal %s (%s); AI must not run "
@@ -900,7 +901,7 @@ class OneHourScheduler:
         if engine_result.outcome is SignalOutcome.BLOCKED_OPEN_SIGNAL:
             # A concurrent creator (another process) won the race; the safe
             # re-read reports the blocking signal instead of inventing an error.
-            blocking = self.state.active_signal()
+            blocking = self.state.active_signal_for(analysis.symbol)
             if blocking is not None:
                 self._log_candle(
                     SchedulerOutcome.BLOCKED_ACTIVE_SIGNAL.value,
@@ -1248,7 +1249,7 @@ class OneHourScheduler:
         keeps its TP/SL monitor untouched. Never raises.
         """
         try:
-            active = self.state.active_signal()
+            active = self.state.active_signal_for(self.symbol)
         except Exception as exc:
             logger.warning("[Scheduler] blackout %s: active read failed: %s", event_key, exc)
             return 0
@@ -1283,6 +1284,11 @@ class OneHourScheduler:
         if calendar is None:
             return None
         try:
+            # Stored Settings overlay (no restart): a saved warn horizon
+            # applies from the next poll; absent/invalid keeps env default.
+            calendar.override_warn_hours(
+                read_stored_warn_hours(self.repository.database)
+            )
             status = calendar.check(now_ms)
         except Exception as exc:  # pragma: no cover - calendar never raises
             logger.warning("[Scheduler] event watch failed: %s", exc)

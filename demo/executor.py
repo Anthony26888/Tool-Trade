@@ -43,13 +43,11 @@ from database.models import (
 
 from .account import (
     DemoConfig,
-    balance_after_close,
     gross_pnl,
     net_pnl,
     resolve_quantity,
     slippage_factor,
     total_fee,
-    update_peak_equity,
     validate_config,
 )
 from .position import DemoAccountRecord, DemoPosition, DemoTrade
@@ -59,6 +57,11 @@ logger = logging.getLogger(__name__)
 
 CLOSE_REASON_TP = "TP"
 CLOSE_REASON_SL = "SL"
+
+#: Maximum concurrent OPEN demo positions per account (plan B' defense in
+#: depth). Per-symbol signal slots already bound this to the enabled symbol
+#: count; the cap only fires if a slot bug ever over-commits shared margin.
+MAX_OPEN_POSITIONS = 3
 
 
 class DemoExecutor:
@@ -107,7 +110,11 @@ class DemoExecutor:
         """Persist the OPEN demo position for a signal that reached OPEN.
 
         Idempotent: an existing position for the signal is returned unchanged.
-        Returns ``None`` when the signal is not OPEN (nothing to open).
+        Returns ``None`` when the signal is not OPEN (nothing to open), when
+        the account cannot cover the margin, or when the account already
+        holds ``MAX_OPEN_POSITIONS`` OPEN positions (plan B' concurrent cap:
+        per-symbol slots already bound this, the cap is defense in depth so
+        a slot bug can never over-commit shared margin).
         """
         if signal is None or signal.status != STATUS_OPEN:
             return None
@@ -122,6 +129,18 @@ class DemoExecutor:
                 signal.id,
                 account.balance,
                 account.margin_per_trade,
+            )
+            return None
+        open_count = len(
+            self.repository.list_positions(account_id=account.id, status="OPEN")
+        )
+        if open_count >= MAX_OPEN_POSITIONS:
+            logger.warning(
+                "[Demo] cannot open position for signal %s: %d OPEN positions "
+                "already (cap %d)",
+                signal.id,
+                open_count,
+                MAX_OPEN_POSITIONS,
             )
             return None
         # Slippage is execution-time config (not persisted per account row);
@@ -207,16 +226,6 @@ class DemoExecutor:
             position.position_size,
             fee_rate,
         )
-        next_balance = balance_after_close(
-            account.balance,
-            signal.direction,
-            position.entry_price,
-            exit_exec,
-            position.quantity,
-            position.position_size,
-            fee_rate,
-        )
-        next_peak = update_peak_equity(account.peak_equity, next_balance)
         result = "WIN" if net > 0 else "LOSS"
         pnl_percent = (net / position.margin) * 100 if position.margin else Decimal("0")
 
@@ -237,13 +246,10 @@ class DemoExecutor:
             pnl_percent=pnl_percent,
             result=result,
             closed_at=closed_at,
-            next_balance=next_balance,
-            next_equity=next_balance,
-            next_peak_equity=next_peak,
         )
         logger.info(
-            "[Demo] trade for signal %s recorded: %s net_pnl=%s balance=%s",
-            signal.id, result, net, next_balance,
+            "[Demo] trade for signal %s recorded: %s net_pnl=%s",
+            signal.id, result, net,
         )
         return DemoTrade.from_row(row)
 

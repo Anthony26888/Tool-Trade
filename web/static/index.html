@@ -4,6 +4,14 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="theme-color" content="#0b1117" />
+  <script>
+  try {
+    var _th = localStorage.getItem("nextra.theme") || "dark";
+    if (_th === "light") document.documentElement.setAttribute("data-theme", "light");
+    var _lg = localStorage.getItem("nextra.lang") || "en";
+    document.documentElement.setAttribute("lang", _lg);
+  } catch (_) {}
+  </script>
   <title>NEXTRA AI — BTCUSDT Signal Engine</title>
   <link rel="icon" type="image/png" href="/static/ai.png" />
   <link rel="stylesheet" href="/static/style.css" />
@@ -19,17 +27,17 @@
         </div>
       </div>
       <nav class="nav">
-        <button class="nav-item active" data-panel="dashboard">Dashboard</button>
-        <button class="nav-item" data-panel="signals">Signals</button>
-        <button class="nav-item" data-panel="daemon">Daemon Log</button>
-        <button class="nav-item" data-panel="events">Events</button>
-        <button class="nav-item" data-panel="trades">Trades</button>
-        <button class="nav-item" data-panel="statistics">Statistics</button>
-        <button class="nav-item" data-panel="settings">Settings</button>
+        <button class="nav-item active" data-panel="dashboard" data-i18n="nav.dashboard">Dashboard</button>
+        <button class="nav-item" data-panel="signals" data-i18n="nav.signals">Signals</button>
+        <button class="nav-item" data-panel="daemon" data-i18n="nav.daemon">Daemon Log</button>
+        <button class="nav-item" data-panel="events" data-i18n="nav.events">Events</button>
+        <button class="nav-item" data-panel="trades" data-i18n="nav.trades">Trades</button>
+        <button class="nav-item" data-panel="statistics" data-i18n="nav.statistics">Statistics</button>
+        <button class="nav-item" data-panel="settings" data-i18n="nav.settings">Settings</button>
       </nav>
       <div class="sidebar-foot">
-        <div class="foot-row"><span>Symbol</span><strong id="sideSymbol">BTCUSDT</strong></div>
-        <div class="foot-row"><span>Mode</span><strong class="mode-chip">DEMO</strong></div>
+        <div class="foot-row"><span data-i18n="side.symbol">Symbol</span><strong id="sideSymbol">BTCUSDT</strong></div>
+        <div class="foot-row"><span data-i18n="side.mode">Mode</span><strong class="mode-chip">DEMO</strong></div>
       </div>
     </aside>
 
@@ -41,6 +49,8 @@
         </div>
         <div class="topbar-right">
           <span id="statusPill" class="status-pill">—</span>
+          <button type="button" id="themeBtn" class="icon-btn" title="Dark / light theme" aria-label="Toggle theme">🌙</button>
+          <button type="button" id="langBtn" class="icon-btn lang-btn" title="English / Tiếng Việt" aria-label="Toggle language">EN</button>
           <button type="button" id="eventsBtn" class="icon-btn" title="Macro events calendar" aria-label="Macro events calendar">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>
           </button>
@@ -53,27 +63,28 @@
       <button type="button" id="eventBanner" class="event-banner" hidden></button>
 
       <section id="panel-dashboard" class="panel active">
+        <div id="portfolioBar" class="portfolio-bar" hidden></div>
         <div class="cards" id="dashboardCards"></div>
         <section class="card">
           <div class="card-head">
-            <h2 class="card-title" id="priceCardTitle">BTCUSDT Price</h2>
-            <div class="chart-controls">
-              <span id="chartLive" class="chart-live"></span>
-              <select id="chartInterval" class="chart-interval" aria-label="Chart timeframe">
-                <option value="1m">1M</option>
-                <option value="5m">5M</option>
-                <option value="15m">15M</option>
-                <option value="1h" selected>1H</option>
-                <option value="4h">4H</option>
-              </select>
-            </div>
+          <h2 class="card-title" id="priceCardTitle">BTCUSDT Price</h2>
+          <div class="chart-controls">
+            <span id="chartLive" class="chart-live"></span>
+            <select id="chartInterval" class="chart-interval" aria-label="Chart timeframe">
+              <option value="1m">1M</option>
+              <option value="5m">5M</option>
+              <option value="15m">15M</option>
+              <option value="1h" selected>1H</option>
+              <option value="4h">4H</option>
+            </select>
           </div>
-          <div class="chart-toolbar">
-            <button type="button" id="chartZoomIn" class="chart-btn" title="Zoom in">＋</button>
-            <button type="button" id="chartZoomOut" class="chart-btn" title="Zoom out">−</button>
-            <button type="button" id="chartPanLeft" class="chart-btn" title="Pan left">◀</button>
-            <button type="button" id="chartPanRight" class="chart-btn" title="Pan right">▶</button>
-            <button type="button" id="chartReset" class="chart-btn secondary" title="Reset view">Reset</button>
+        </div>
+        <div class="chart-toolbar">
+          <button type="button" id="chartZoomIn" class="chart-btn" title="Zoom in">＋</button>
+          <button type="button" id="chartZoomOut" class="chart-btn" title="Zoom out">−</button>
+          <button type="button" id="chartPanLeft" class="chart-btn" title="Pan left">◀</button>
+          <button type="button" id="chartPanRight" class="chart-btn" title="Pan right">▶</button>
+          <button type="button" id="chartReset" class="chart-btn secondary" title="Reset view" data-i18n="chart.reset">Reset</button>
             <span id="chartRange" class="chart-range"></span>
           </div>
           <div class="chart-wrap">
@@ -86,13 +97,13 @@
         <div class="grid-2">
           <section class="card">
             <div class="card-head">
-              <h2 class="card-title">Current Signal</h2>
+              <h2 class="card-title" data-i18n="dash.signal">Current Signal</h2>
               <button type="button" id="chatOpenBtn" class="btn ai-btn" title="Ask about this signal">🤖 AI</button>
             </div>
             <div id="currentSignal"></div>
           </section>
           <section class="card">
-            <h2 class="card-title">System Health</h2>
+            <h2 class="card-title" data-i18n="dash.health">System Health</h2>
             <div id="systemHealth"></div>
           </section>
         </div>
@@ -100,18 +111,18 @@
 
       <section id="panel-signals" class="panel">
         <section class="card">
-          <h2 class="card-title">Signal History</h2>
+          <h2 class="card-title" data-i18n="sig.title">Signal History</h2>
           <div class="toolbar" id="signalsToolbar">
-            <label class="toolbar-item">Direction
+            <label class="toolbar-item"><span data-i18n="sig.direction">Direction</span>
               <select id="sigDir">
-                <option value="">All</option>
+                <option value="" data-i18n="common.all">All</option>
                 <option value="LONG">LONG</option>
                 <option value="SHORT">SHORT</option>
               </select>
             </label>
-            <label class="toolbar-item">Status
+            <label class="toolbar-item"><span data-i18n="sig.status">Status</span>
               <select id="sigStatus">
-                <option value="">All</option>
+                <option value="" data-i18n="common.all">All</option>
                 <option value="TP_HIT">TP HIT</option>
                 <option value="SL_HIT">SL HIT</option>
                 <option value="PENDING_ENTRY">PENDING</option>
@@ -119,75 +130,77 @@
                 <option value="CANCELLED">CANCELLED</option>
               </select>
             </label>
-            <label class="toolbar-item">Time (VN)
+            <label class="toolbar-item"><span data-i18n="common.time">Time (VN)</span>
               <select id="sigTime">
-                <option value="">All</option>
-                <option value="today">Today</option>
+                <option value="" data-i18n="common.all">All</option>
+                <option value="today" data-i18n="common.today">Today</option>
                 <option value="7d">7 days</option>
                 <option value="30d">30 days</option>
               </select>
             </label>
-            <button class="btn toolbar-item" id="sigSelAll" type="button">Select all</button>
-            <button class="btn danger toolbar-item" id="sigDeleteSel" type="button" disabled>Delete selected (0)</button>
-            <button class="btn danger toolbar-item" id="sigDeleteAll" type="button">Delete all history</button>
+            <button class="btn toolbar-item" id="sigSelAll" type="button" data-i18n="sig.selectAll">Select all</button>
+            <button class="btn danger toolbar-item" id="sigDeleteSel" type="button" disabled data-i18n="sig.deleteSel">Delete selected (0)</button>
+            <button class="btn danger toolbar-item" id="sigDeleteAll" type="button" data-i18n="sig.deleteAll">Delete all history</button>
           </div>
-          <div class="table-wrap" id="signalsTable"><p class="muted">Loading…</p></div>
+          <div class="table-wrap" id="signalsTable"><p class="muted" data-i18n="common.loading">Loading…</p></div>
           <div class="pager" id="signalsPager" hidden></div>
         </section>
       </section>
 
       <section id="panel-daemon" class="panel">
         <section class="card">
-          <h2 class="card-title">Daemon Activity per 1H Candle</h2>
+          <h2 class="card-title" data-i18n="daemon.title">Daemon Activity per 1H Candle</h2>
           <div class="toolbar">
-            <label class="toolbar-item">Decision
+            <label class="toolbar-item"><span data-i18n="daemon.decision">Decision</span>
               <select id="ddDir">
-                <option value="">All</option>
+                <option value="" data-i18n="common.all">All</option>
                 <option value="LONG">LONG</option>
                 <option value="SHORT">SHORT</option>
                 <option value="WAIT">WAIT</option>
                 <option value="NONE">NONE (locked/error)</option>
               </select>
             </label>
-            <label class="toolbar-item">Time (VN)
+            <label class="toolbar-item"><span data-i18n="common.time">Time (VN)</span>
               <select id="ddTime">
-                <option value="">All</option>
-                <option value="today">Today</option>
+                <option value="" data-i18n="common.all">All</option>
+                <option value="today" data-i18n="common.today">Today</option>
                 <option value="7d">7 days</option>
                 <option value="30d">30 days</option>
               </select>
             </label>
-            <button class="btn danger toolbar-item" id="ddClear" type="button">Clear log</button>
-            <span class="hint toolbar-item">Click a row for reasoning, indicator snapshot &amp; prices.</span>
+            <button class="btn toolbar-item" id="ddSelAll" type="button" data-i18n="daemon.selectAll">Select all</button>
+            <button class="btn danger toolbar-item" id="ddDeleteSel" type="button" disabled data-i18n="daemon.deleteSel">Delete selected (0)</button>
+            <button class="btn danger toolbar-item" id="ddClear" type="button" data-i18n="daemon.clear">Clear log</button>
+            <span class="hint toolbar-item" data-i18n="daemon.hint">Click a row for reasoning, indicator snapshot &amp; prices.</span>
           </div>
-          <div class="table-wrap" id="daemonTable"><p class="muted">Loading…</p></div>
+          <div class="table-wrap" id="daemonTable"><p class="muted" data-i18n="common.loading">Loading…</p></div>
           <div class="pager" id="daemonPager" hidden></div>
         </section>
       </section>
 
       <section id="panel-trades" class="panel">
         <section class="card">
-          <h2 class="card-title">Demo Trades</h2>
-          <div class="table-wrap" id="tradesTable"><p class="muted">Loading…</p></div>
+          <h2 class="card-title" data-i18n="trades.title">Demo Trades</h2>
+          <div class="table-wrap" id="tradesTable"><p class="muted" data-i18n="common.loading">Loading…</p></div>
         </section>
       </section>
 
       <section id="panel-events" class="panel">
         <section class="card">
           <div class="card-head">
-            <h2 class="card-title">Macro Events — new positions pause inside ⏸ windows</h2>
+            <h2 class="card-title" data-i18n="events.title">Macro Events — new positions pause inside ⏸ windows</h2>
             <div class="cal-nav">
               <button type="button" id="calPrev" class="btn" title="Previous month">‹</button>
-              <button type="button" id="calToday" class="btn secondary" title="Back to this month">Today</button>
+              <button type="button" id="calToday" class="btn secondary" title="Back to this month" data-i18n="events.today">Today</button>
               <button type="button" id="calNext" class="btn" title="Next month">›</button>
             </div>
           </div>
           <h3 class="cal-month" id="calMonth">—</h3>
           <div class="cal-grid cal-week" aria-hidden="true">
-            <span>T2</span><span>T3</span><span>T4</span><span>T5</span><span>T6</span><span>T7</span><span>CN</span>
+            <span data-i18n="wd.mon">T2</span><span data-i18n="wd.tue">T3</span><span data-i18n="wd.wed">T4</span><span data-i18n="wd.thu">T5</span><span data-i18n="wd.fri">T6</span><span data-i18n="wd.sat">T7</span><span data-i18n="wd.sun">CN</span>
           </div>
-          <div class="cal-grid" id="calGrid"><p class="muted">Loading…</p></div>
-          <p class="hint">Tap a day for details. Times in Vietnam (+07). Calendar data: <a href="https://www.financecalendar.com" target="_blank" rel="noopener">financecalendar.com</a> · <span id="calSource">Nguồn: …</span></p>
+          <div class="cal-grid" id="calGrid"><p class="muted" data-i18n="common.loading">Loading…</p></div>
+          <p class="hint"><span data-i18n="events.footer">Tap a day for details. Times in Vietnam (+07). Calendar data:</span> <a href="https://www.financecalendar.com" target="_blank" rel="noopener">financecalendar.com</a> · <span id="calSource">Nguồn: …</span></p>
         </section>
         <dialog id="eventDialog" class="event-dialog">
           <div class="event-dialog-head">
@@ -201,8 +214,38 @@
       <section id="panel-statistics" class="panel">
         <div class="cards" id="statsCards"></div>
         <section class="card">
-          <h2 class="card-title">Performance Detail</h2>
+            <h2 class="card-title" data-i18n="stats.detail">Performance Detail</h2>
           <div id="statsDetail"></div>
+        </section>
+        <section class="card">
+          <div class="card-head">
+            <h2 class="card-title" data-i18n="quota.title">LLM Quota Usage</h2>
+            <div class="chart-controls">
+              <select id="quotaRange" class="chart-interval" aria-label="Quota time range">
+                <option value="today" data-i18n="common.today">Today</option>
+                <option value="7d" selected>7D</option>
+                <option value="30d">30D</option>
+                <option value="all" data-i18n="common.all">All</option>
+              </select>
+            </div>
+          </div>
+          <div class="quota-costrow">
+            <label><span data-i18n="quota.perCall">Cost per request (VND)</span>
+              <input type="number" id="quotaPrice" min="0" max="1000000" step="1" />
+            </label>
+            <button type="button" class="btn secondary" id="quotaSavePrice" data-i18n="quota.save">Save</button>
+            <span class="hint" id="quotaCostNote"></span>
+          </div>
+          <div class="cards" id="quotaCards"></div>
+          <div class="chart-wrap quota-chart-wrap">
+            <canvas id="quotaChart"></canvas>
+            <div id="quotaTip" class="quota-tip" hidden></div>
+          </div>
+          <h3 class="card-subtitle" data-i18n="quota.byModel">Usage by model</h3>
+          <div class="table-wrap" id="quotaModels"></div>
+          <h3 class="card-subtitle" data-i18n="quota.byDay">Usage by day</h3>
+          <div class="table-wrap" id="quotaTable"><p class="muted" data-i18n="common.loading">Loading…</p></div>
+          <div class="pager" id="quotaPager" hidden></div>
         </section>
       </section>
 
@@ -210,42 +253,47 @@
         <div id="settingsNotice"></div>
         <div class="grid-2">
           <section class="card">
-            <h2 class="card-title">AI Provider</h2>
+            <h2 class="card-title" data-i18n="set.ai">AI Provider</h2>
             <form id="aiForm" class="form"></form>
           </section>
           <section class="card">
-            <h2 class="card-title">Demo Account</h2>
+            <h2 class="card-title" data-i18n="set.demo">Demo Account</h2>
             <form id="demoForm" class="form"></form>
           </section>
         </div>
         <div class="grid-2">
           <section class="card">
-            <h2 class="card-title">Telegram Notifications</h2>
+            <h2 class="card-title" data-i18n="set.telegram">Telegram Notifications</h2>
             <form id="telegramForm" class="form"></form>
           </section>
           <section class="card">
-            <h2 class="card-title">Runtime &amp; System</h2>
+            <h2 class="card-title" data-i18n="set.strategy">Strategy Tuning</h2>
+            <form id="strategyForm" class="form"></form>
+          </section>
+        </div>
+        <section class="card">
+            <h2 class="card-title" data-i18n="set.runtime">Runtime &amp; System</h2>
             <form id="symbolForm" class="form">
               <div class="field">
-                <label>Active Symbol (analysed)</label>
+                <label data-i18n="set.symbolDisplay">Display Symbol (dashboard default)</label>
                 <select id="symbolSelect" aria-label="Analysed symbol">
                   <option value="BTCUSDT">BTCUSDT</option>
                   <option value="ETHUSDT">ETHUSDT</option>
                   <option value="XAUUSDT">XAUUSDT</option>
                 </select>
               </div>
-              <div class="hint">One symbol is analysed at a time (1H closed candles). A switch applies to the NEXT analysis once no signal is active — an open position is never affected.</div>
-              <button type="button" class="btn" id="saveSymbol">Save Symbol</button>
+              <div class="hint" data-i18n="set.symbolHint">Display default for the chart and single-symbol runs. Which symbols actually run is decided by Trading Symbols below — each runs its own daemon.</div>
+              <button type="button" class="btn" id="saveSymbol" data-i18n="set.saveSymbol">Save Symbol</button>
             </form>
             <div id="runtimeBox" class="form"></div>
+            <form id="symbolsForm" class="form" style="margin-top:12px"></form>
             <div style="margin-top:10px">
-              <button type="button" class="btn danger" id="clearErrorBtn">Clear last error</button>
+              <button type="button" class="btn danger" id="clearErrorBtn" data-i18n="set.clearError">Clear last error</button>
             </div>
-          </section>
-        </div>
+        </section>
         <section class="card">
-          <h2 class="card-title">Settings Audit</h2>
-          <div class="table-wrap" id="auditBox"><p class="muted">Loading…</p></div>
+          <h2 class="card-title" data-i18n="set.audit">Settings Audit</h2>
+          <div class="table-wrap" id="auditBox"><p class="muted" data-i18n="common.loading">Loading…</p></div>
         </section>
       </section>
     </main>
@@ -255,44 +303,44 @@
   <aside id="chatDrawer" class="chat-drawer" aria-hidden="true" aria-label="Signal chat">
     <div class="chat-head">
       <div>
-        <div class="chat-title">Signal Chat · NEXTRA AI</div>
+        <div class="chat-title" data-i18n="chat.title">Signal Chat · NEXTRA AI</div>
         <div id="chatContext" class="chat-context"></div>
       </div>
       <button type="button" id="chatClose" class="chat-close" title="Close">×</button>
     </div>
-    <div id="chatMessages" class="chat-messages"><p class="muted">Start a conversation about the current signal.</p></div>
+    <div id="chatMessages" class="chat-messages"><p class="muted" data-i18n="chat.empty">Start a conversation about the current signal.</p></div>
     <div class="chat-quick">
-      <button type="button" class="chat-chip" data-q="Tại sao chọn signal này?">Tại sao chọn?</button>
-      <button type="button" class="chat-chip" data-q="Rủi ro nếu Stop Loss bị chạm là như thế nào?">Rủi ro SL?</button>
-      <button type="button" class="chat-chip" data-q="Tóm tắt chiến lược của signal này.">Tóm tắt chiến lược</button>
+      <button type="button" class="chat-chip" data-q="Tại sao chọn signal này?" data-i18n="chat.q1">Tại sao chọn?</button>
+      <button type="button" class="chat-chip" data-q="Rủi ro nếu Stop Loss bị chạm là như thế nào?" data-i18n="chat.q2">Rủi ro SL?</button>
+      <button type="button" class="chat-chip" data-q="Tóm tắt chiến lược của signal này." data-i18n="chat.q3">Tóm tắt chiến lược</button>
     </div>
     <div class="chat-input-row">
-      <input type="text" id="chatInput" placeholder="Ask about this signal…" maxlength="1000" autocomplete="off" />
-      <button type="button" id="chatSend" class="btn">Send</button>
-      <button type="button" id="chatClear" class="btn secondary" title="Clear conversation">Clear</button>
+      <input type="text" id="chatInput" data-i18n-ph="chat.placeholder" placeholder="Ask about this signal…" maxlength="1000" autocomplete="off" />
+      <button type="button" id="chatSend" class="btn" data-i18n="chat.send">Send</button>
+      <button type="button" id="chatClear" class="btn secondary" title="Clear conversation" data-i18n="chat.clear">Clear</button>
     </div>
   </aside>
 
   <nav class="bottom-nav" aria-label="Mobile navigation">
     <button type="button" class="nav-item" data-panel="signals" title="Signals">
       <span class="nav-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 17l5-6 4 3 6-8"/><path d="M18 6h3v3"/></svg></span>
-      <span class="nav-label">Signals</span>
+      <span class="nav-label" data-i18n="nav.signals">Signals</span>
     </button>
     <button type="button" class="nav-item" data-panel="daemon" title="Daemon Log">
       <span class="nav-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></span>
-      <span class="nav-label">Daemon</span>
+      <span class="nav-label" data-i18n="nav.daemonShort">Daemon</span>
     </button>
     <button type="button" class="nav-item nav-center" data-panel="dashboard" title="Dashboard">
       <span class="nav-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 10.5L12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M10 21v-5h4v5"/></svg></span>
-      <span class="nav-label">Dashboard</span>
+      <span class="nav-label" data-i18n="nav.dashboard">Dashboard</span>
     </button>
     <button type="button" class="nav-item" data-panel="trades" title="Trades">
       <span class="nav-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3v14"/><path d="M4 7l4-4 4 4"/><path d="M16 21V7"/><path d="M12 17l4 4 4-4"/></svg></span>
-      <span class="nav-label">Trades</span>
+      <span class="nav-label" data-i18n="nav.trades">Trades</span>
     </button>
     <button type="button" class="nav-item" data-panel="statistics" title="Statistics">
       <span class="nav-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20h16"/><path d="M7 20v-6"/><path d="M12 20V9"/><path d="M17 20v-8"/></svg></span>
-      <span class="nav-label">Stats</span>
+      <span class="nav-label" data-i18n="nav.statsShort">Stats</span>
     </button>
   </nav>
 

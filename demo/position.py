@@ -139,9 +139,13 @@ class DemoTrade:
     result: str
     opened_at: str
     closed_at: str
+    #: Symbol inherited from the closed position (None when the position row
+    #: is gone or the query did not join it). Display only, never math input.
+    symbol: str | None = None
 
     @classmethod
     def from_row(cls, row) -> DemoTrade:
+        keys = row.keys() if hasattr(row, "keys") else ()
         return cls(
             id=int(row["id"]),
             account_id=int(row["account_id"]),
@@ -161,6 +165,7 @@ class DemoTrade:
             result=row["result"],
             opened_at=row["opened_at"],
             closed_at=row["closed_at"],
+            symbol=row["position_symbol"] if "position_symbol" in keys else None,
         )
 
 

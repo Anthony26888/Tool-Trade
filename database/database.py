@@ -699,13 +699,14 @@ class SignalRepository:
         opened = opened_at
         with self.database.transaction() as conn:
             existing = conn.execute(
-                "SELECT 1 FROM signals WHERE status IN (?, ?) LIMIT 1",
-                (STATUS_PENDING_ENTRY, STATUS_OPEN),
+                "SELECT 1 FROM signals WHERE symbol = ? AND status IN (?, ?) LIMIT 1",
+                (symbol, STATUS_PENDING_ENTRY, STATUS_OPEN),
             ).fetchone()
             if existing is not None:
                 raise SignalExistsError(
-                    "an active signal (PENDING_ENTRY or OPEN) already exists; "
-                    "only one signal may be pending/open at any time"
+                    f"an active signal (PENDING_ENTRY or OPEN) for {symbol} "
+                    "already exists; only one signal may be pending/open per "
+                    "symbol at any time"
                 )
             cursor = conn.execute(
                 """
@@ -762,6 +763,16 @@ class SignalRepository:
             ).fetchone()
         return Signal.from_row(row) if row is not None else None
 
+    def get_open_signal_for_symbol(self, symbol: str) -> Signal | None:
+        """Return the OPEN signal for one symbol, or None (plan B')."""
+        with self.database.read() as conn:
+            row = conn.execute(
+                "SELECT * FROM signals WHERE symbol = ? AND status = ? "
+                "ORDER BY id LIMIT 1",
+                (symbol, STATUS_OPEN),
+            ).fetchone()
+        return Signal.from_row(row) if row is not None else None
+
     def get_active_signal(self) -> Signal | None:
         """Return the single active signal (PENDING_ENTRY or OPEN), or None.
 
@@ -774,6 +785,36 @@ class SignalRepository:
                 (STATUS_PENDING_ENTRY, STATUS_OPEN),
             ).fetchone()
         return Signal.from_row(row) if row is not None else None
+
+    def get_active_signal_for_symbol(self, symbol: str) -> Signal | None:
+        """Return the active signal for one symbol, or None (plan B').
+
+        The per-symbol slot is the multi-symbol invariant: a BTCUSDT position
+        never blocks ETHUSDT analysis. The global variant stays for
+        single-symbol callers (locks, CLI, compat).
+        """
+        with self.database.read() as conn:
+            row = conn.execute(
+                "SELECT * FROM signals WHERE symbol = ? AND status IN (?, ?) "
+                "ORDER BY id LIMIT 1",
+                (symbol, STATUS_PENDING_ENTRY, STATUS_OPEN),
+            ).fetchone()
+        return Signal.from_row(row) if row is not None else None
+
+    def list_active_signals(self) -> list[Signal]:
+        """All PENDING_ENTRY/OPEN signals, oldest first.
+
+        Single-symbol deployments always hold at most one (the repository
+        invariant); multi-symbol (plan B') holds at most one per symbol.
+        Display and per-symbol gates consume this list; recovery and the
+        monitor scope it to their symbol.
+        """
+        with self.database.read() as conn:
+            rows = conn.execute(
+                "SELECT * FROM signals WHERE status IN (?, ?) ORDER BY id",
+                (STATUS_PENDING_ENTRY, STATUS_OPEN),
+            ).fetchall()
+        return [Signal.from_row(row) for row in rows]
 
     def list_signals(
         self,
@@ -1450,18 +1491,16 @@ class DemoRepository:
         pnl_percent: Any,
         result: str,
         closed_at: str | None = None,
-        next_balance: Any,
-        next_equity: Any,
-        next_peak_equity: Any,
         updated_at: str | None = None,
     ) -> sqlite3.Row:
         """Close a position, insert its trade, and update the account balance.
 
-        All reads/writes happen inside a single ``BEGIN IMMEDIATE`` transaction.
-        ``next_balance`` is the Phase 8 ``balance_after_close`` result
-        (``current_balance + net_pnl``) and ``next_peak_equity`` the Phase 8
-        ``update_peak_equity`` result; the repo stores exactly what the formulas
-        return and never re-derives strategy numbers.
+        All reads/writes happen inside a single ``BEGIN IMMEDIATE`` transaction,
+        INCLUDING the balance read: ``next = balance + net_pnl`` is computed
+        from the row locked in-transaction, so two concurrent closes (plan B':
+        two daemons sharing one account) serialize and neither trade's PnL is
+        lost. Callers pass the already-validated ``net_pnl``; this method never
+        re-derives strategy numbers, it only applies them atomically.
         """
         if side not in DIRECTIONS:
             raise DemoValidationError(f"side must be one of {sorted(DIRECTIONS)}")
@@ -1522,6 +1561,15 @@ class DemoRepository:
             ).fetchone()
             if account is None:
                 raise DemoNotFoundError(f"no demo account with id {account_id}")
+            net_value = to_decimal_signed(net_pnl, "net_pnl")
+            current_balance = Decimal(str(account["balance"]))
+            current_peak = Decimal(str(account["peak_equity"]))
+            next_balance_value = current_balance + net_value
+            next_peak_value = (
+                next_balance_value
+                if next_balance_value > current_peak
+                else current_peak
+            )
             conn.execute(
                 """
                 UPDATE demo_accounts
@@ -1529,9 +1577,9 @@ class DemoRepository:
                 WHERE id = ?
                 """,
                 (
-                    str(to_decimal(next_balance, "balance")),
-                    str(to_decimal(next_equity, "equity")),
-                    str(to_decimal(next_peak_equity, "peak_equity")),
+                    str(next_balance_value),
+                    str(next_balance_value),
+                    str(next_peak_value),
                     updated,
                     account_id,
                 ),
@@ -1551,19 +1599,28 @@ class DemoRepository:
     def list_trades(
         self, account_id: int | None = None, *, limit: int = 100
     ) -> list[sqlite3.Row]:
-        """Recent trades (newest first)."""
+        """Recent trades (newest first), each carrying its position's symbol.
+
+        The ``position_symbol`` extra is consumed by ``DemoTrade.from_row``
+        (display only); callers ignoring it see no behavior change.
+        """
         if limit < 0:
             raise DemoValidationError("limit must be non-negative")
+        base = (
+            "SELECT demo_trades.*, demo_positions.symbol AS position_symbol "
+            "FROM demo_trades LEFT JOIN demo_positions "
+            "ON demo_positions.id = demo_trades.position_id"
+        )
         with self.database.read() as conn:
             if account_id is not None:
                 rows = conn.execute(
-                    "SELECT * FROM demo_trades WHERE account_id = ? "
-                    "ORDER BY id DESC LIMIT ?",
+                    f"{base} WHERE demo_trades.account_id = ? "
+                    "ORDER BY demo_trades.id DESC LIMIT ?",
                     (account_id, limit),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT * FROM demo_trades ORDER BY id DESC LIMIT ?", (limit,)
+                    f"{base} ORDER BY demo_trades.id DESC LIMIT ?", (limit,)
                 ).fetchall()
         return list(rows)
 
@@ -1887,6 +1944,162 @@ class CandleLogRepository:
         with self.database.transaction() as conn:
             cursor = conn.execute("DELETE FROM candle_log")
         return int(cursor.rowcount)
+
+    def delete_rows(self, ids: list[int]) -> int:
+        """Delete candle-log rows by id; returns how many were removed.
+
+        Unknown/malformed ids are ignored (never raises for them); an empty
+        list is a no-op. Diagnostic rows only — never touches signals,
+        positions, or trades.
+        """
+        clean = sorted(
+            {
+                int(candidate)
+                for candidate in ids or []
+                if isinstance(candidate, int)
+                and not isinstance(candidate, bool)
+                and candidate > 0
+            }
+        )
+        if not clean:
+            return 0
+        placeholders = ", ".join("?" for _ in clean)
+        with self.database.transaction() as conn:
+            cursor = conn.execute(
+                f"DELETE FROM candle_log WHERE id IN ({placeholders})", clean
+            )
+        return int(cursor.rowcount)
+
+    def quota_summary(self, since: str | None = None) -> dict[str, object]:
+        """Aggregate LLM quota usage (totals + per Vietnam day).
+
+        ``since`` is an inclusive ISO-8601 UTC bound on ``recorded_at``
+        (None = all history). NULL token counts are skipped, never zeroed.
+        Metered vs ``~`` estimated tokens are reported separately
+        (``tokens_estimated`` flag). Days use Vietnam wall-clock
+        (``+7 hours``), newest first. Read-only; never raises for bad input.
+        """
+        try:
+            clauses = []
+            params: list[object] = []
+            if since:
+                clauses.append("recorded_at >= ?")
+                params.append(str(since))
+            where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            with self.database.read() as conn:
+                total = conn.execute(
+                    "SELECT COUNT(*) AS n, "
+                    "COALESCE(SUM(llm_calls), 0) AS calls, "
+                    "COALESCE(SUM(prompt_tokens), 0) AS prompt, "
+                    "COALESCE(SUM(completion_tokens), 0) AS completion, "
+                    "COALESCE(SUM(total_tokens), 0) AS total, "
+                    "COALESCE(SUM(CASE WHEN tokens_estimated = 1 THEN prompt_tokens ELSE 0 END), 0) AS prompt_est, "
+                    "COALESCE(SUM(CASE WHEN tokens_estimated = 1 THEN completion_tokens ELSE 0 END), 0) AS completion_est, "
+                    "COALESCE(SUM(CASE WHEN tokens_estimated = 1 THEN total_tokens ELSE 0 END), 0) AS total_est "
+                    f"FROM candle_log {where}",
+                    params,
+                ).fetchone()
+                days = conn.execute(
+                    "SELECT date(recorded_at, '+7 hours') AS day, "
+                    "COUNT(*) AS n, "
+                    "COALESCE(SUM(llm_calls), 0) AS calls, "
+                    "COALESCE(SUM(prompt_tokens), 0) AS prompt, "
+                    "COALESCE(SUM(completion_tokens), 0) AS completion, "
+                    "COALESCE(SUM(total_tokens), 0) AS total "
+                    f"FROM candle_log {where} "
+                    "GROUP BY day ORDER BY day DESC",
+                    params,
+                ).fetchall()
+                models = conn.execute(
+                    "SELECT COALESCE(NULLIF(model, ''), 'unknown') AS model, "
+                    "COUNT(*) AS n, "
+                    "COALESCE(SUM(llm_calls), 0) AS calls, "
+                    "COALESCE(SUM(prompt_tokens), 0) AS prompt, "
+                    "COALESCE(SUM(completion_tokens), 0) AS completion, "
+                    "COALESCE(SUM(total_tokens), 0) AS total, "
+                    "COALESCE(SUM(CASE WHEN outcome IN ('ERROR', 'RATE_LIMITED') THEN 1 ELSE 0 END), 0) AS failed "
+                    f"FROM candle_log {where} "
+                    "GROUP BY model ORDER BY total DESC",
+                    params,
+                ).fetchall()
+                decided = conn.execute(
+                    "SELECT "
+                    "COALESCE(SUM(CASE WHEN outcome IN ('WAIT', 'CREATED', 'REJECTED') THEN 1 ELSE 0 END), 0) AS ok, "
+                    "COALESCE(SUM(CASE WHEN outcome IN ('ERROR', 'RATE_LIMITED') THEN 1 ELSE 0 END), 0) AS failed "
+                    f"FROM candle_log {where}",
+                    params,
+                ).fetchone()
+            def _cell(row: object, key: str) -> int:
+                value = row[key] if hasattr(row, "__getitem__") else None
+                try:
+                    return int(value or 0)
+                except (TypeError, ValueError):
+                    return 0
+
+            get = _cell
+            prompt, prompt_est = get(total, "prompt"), get(total, "prompt_est")
+            completion, completion_est = get(total, "completion"), get(total, "completion_est")
+            total_tokens, total_est = get(total, "total"), get(total, "total_est")
+            ok_count, failed_count = get(decided, "ok"), get(decided, "failed")
+            judged = ok_count + failed_count
+            model_rows = []
+            for row in models:
+                m_ok = get(row, "n") - get(row, "failed")
+                m_total = get(row, "n")
+                model_rows.append(
+                    {
+                        "model": row["model"],
+                        "candles": m_total,
+                        "llm_calls": get(row, "calls"),
+                        "prompt_tokens": get(row, "prompt"),
+                        "completion_tokens": get(row, "completion"),
+                        "total_tokens": get(row, "total"),
+                        "success_rate": (m_ok / m_total) if m_total else None,
+                    }
+                )
+            return {
+                "candles": get(total, "n"),
+                "llm_calls": get(total, "calls"),
+                "prompt_tokens": prompt,
+                "completion_tokens": completion,
+                "total_tokens": total_tokens,
+                "prompt_tokens_metered": prompt - prompt_est,
+                "completion_tokens_metered": completion - completion_est,
+                "total_tokens_metered": total_tokens - total_est,
+                "prompt_tokens_estimated": prompt_est,
+                "completion_tokens_estimated": completion_est,
+                "total_tokens_estimated": total_est,
+                "success_rate": (ok_count / judged) if judged else None,
+                "by_model": model_rows,
+                "days": [
+                    {
+                        "day": row["day"],
+                        "candles": get(row, "n"),
+                        "llm_calls": get(row, "calls"),
+                        "prompt_tokens": get(row, "prompt"),
+                        "completion_tokens": get(row, "completion"),
+                        "total_tokens": get(row, "total"),
+                    }
+                    for row in days
+                ],
+            }
+        except Exception:
+            return {
+                "candles": 0,
+                "llm_calls": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "prompt_tokens_metered": 0,
+                "completion_tokens_metered": 0,
+                "total_tokens_metered": 0,
+                "prompt_tokens_estimated": 0,
+                "completion_tokens_estimated": 0,
+                "total_tokens_estimated": 0,
+                "success_rate": None,
+                "by_model": [],
+                "days": [],
+            }
 
 
 def _optional_price(value: Any, raw: Any) -> str | None:

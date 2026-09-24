@@ -1,4 +1,5 @@
 :root {
+  color-scheme: dark;
   --bg: #0b1117;
   --panel: #111a23;
   --card: #0f1720;
@@ -10,6 +11,42 @@
   --red: #ef4444;
   --amber: #f59e0b;
 }
+
+[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f1f4f8;
+  --panel: #ffffff;
+  --card: #ffffff;
+  --border: #d7dfea;
+  --text: #16212e;
+  --muted: #5d6f83;
+  --accent: #2563eb;
+  --green: #15803d;
+  --red: #dc2626;
+  --amber: #b45309;
+}
+
+/* Hardcoded dark surfaces remapped for the light theme. */
+[data-theme="light"] .nav-item:hover,
+[data-theme="light"] .nav-item.active { background: #e4ebf3; }
+[data-theme="light"] .dd-detail td { background: #eaf0f6; }
+[data-theme="light"] .field input[type="text"],
+[data-theme="light"] .field input[type="number"],
+[data-theme="light"] .field input[type="password"],
+[data-theme="light"] .field select,
+[data-theme="light"] .field textarea { background: #f6f9fc; }
+[data-theme="light"] .field select option { background: #ffffff; color: #16212e; }
+/* Remaining dark surfaces outside Settings forms (toolbar filters, chart
+   controls, chat widgets): same light treatment so text stays readable. */
+[data-theme="light"] .toolbar-item select,
+[data-theme="light"] .chart-interval,
+[data-theme="light"] .chart-btn,
+[data-theme="light"] .chat-chip,
+[data-theme="light"] #chatInput { background: #f6f9fc; }
+[data-theme="light"] .bottom-nav { background: rgba(255, 255, 255, 0.94); }
+[data-theme="light"] .event-dialog,
+[data-theme="light"] .chat-drawer { background: #ffffff; }
+[data-theme="light"] .toast { background: #ffffff; }
 
 * { box-sizing: border-box; }
 * { -webkit-tap-highlight-color: transparent; }
@@ -169,10 +206,13 @@ th { color: var(--muted); font-weight: 500; }
   padding: 9px 14px; font-size: 13px; font-weight: 600; cursor: pointer;
 }
 .btn.secondary { background: transparent; border: 1px solid var(--border); color: var(--text); }
-.btn.danger { background: var(--red, #ef4444); }
+.btn.danger { background: var(--red, #ef4444); color: #fff; }
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 10px; }
 .toolbar-item { display: inline-flex; align-items: center; gap: 5px; font-size: 13px; color: var(--text); }
+/* .toolbar-item color would override .btn white text (same specificity, later
+   rule): primary toolbar buttons keep white text on the accent background. */
+.btn.toolbar-item { color: #fff; }
 .toolbar-item select {
   background: #0d1620; border: 1px solid var(--border); color: var(--text);
   border-radius: 8px; padding: 6px 8px; font-size: 13px; cursor: pointer;
@@ -413,6 +453,7 @@ pre.raw { margin: 0; font-size: 12px; white-space: pre-wrap; color: var(--muted)
 }
 .icon-btn:hover { color: var(--text); border-color: var(--accent); }
 .icon-btn svg { width: 18px; height: 18px; }
+.icon-btn.lang-btn { width: auto; min-width: 36px; padding: 0 8px; font-size: 12px; font-weight: 700; }
 
 .event-banner {
   display: block; width: 100%; text-align: left; cursor: pointer;
@@ -458,11 +499,55 @@ span.cal-day { cursor: default; }
 .event-item { margin-bottom: 14px; }
 .event-item h4 { margin: 0 0 6px; font-size: 14px; }
 
+/* Portfolio status line (plan B'): one chip per enabled symbol. */
+.portfolio-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 14px; font-size: 13px; }
+.portfolio-bar[hidden] { display: none; }
+.portfolio-full { font-weight: 700; color: var(--amber); }
+.portfolio-chip { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--border); border-radius: 999px; padding: 3px 10px; }
+.portfolio-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.portfolio-dot.holding { background: var(--amber); }
+.portfolio-dot.ready { background: var(--green); }
+
+/* Phase cards: one compact exchange-style card per symbol position. */
+.pos-grid { display: grid; grid-template-columns: 1fr; gap: 12px; }
+.pos-card { border: 1px solid var(--border); border-left: 4px solid var(--muted); border-radius: 12px; padding: 12px 14px; background: var(--card); display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.pos-card.long { border-left-color: var(--green); }
+.pos-card.short { border-left-color: var(--red); }
+.pos-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; font-size: 15px; }
+.pos-side { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+.lev-chip { border: 1px solid var(--border); border-radius: 999px; padding: 2px 10px; font-size: 12px; font-weight: 700; color: var(--text); }
+.pos-close { border: 1px solid var(--red); background: transparent; color: var(--red); border-radius: 6px; padding: 3px 12px; font-size: 12px; font-weight: 700; cursor: pointer; flex-shrink: 0; }
+.pos-close:hover { background: var(--red); color: #fff; }
+.pos-close:disabled { opacity: 0.5; cursor: default; }
+.manual-tag { border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px; font-size: 11px; color: var(--muted); white-space: nowrap; }
+.pos-pnl { font-size: 24px; font-weight: 800; }
+.pos-pnl span { font-size: 13px; font-weight: 600; }
+.pos-pnl.up { color: var(--green); }
+.pos-pnl.down { color: var(--red); }
+.pos-pnl.flat { font-size: 13px; font-weight: 600; color: var(--muted); }
+.pos-line { display: flex; justify-content: space-between; align-items: center; font-size: 13px; }
+.pos-line.entry { color: var(--text); }
+.pos-line.tp { color: var(--green); }
+.pos-line.sl { color: var(--red); }
+.pos-meta { font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 /* Daemon-log pager */
 .pager { display: flex; align-items: center; justify-content: center; gap: 12px; margin-top: 12px; }
 .pager[hidden] { display: none; }
 .pager-label { font-size: 13px; color: var(--muted); }
 .pager .btn[disabled] { opacity: 0.4; cursor: default; }
+
+/* Quota dashboard (Phase Q): cost row, canvas chart + tooltip. */
+.quota-costrow { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px; margin-bottom: 14px; }
+.quota-costrow label { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: var(--muted); }
+.quota-costrow input[type="number"] { background: #0d1620; border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 8px 10px; font-size: 13px; width: 140px; }
+[data-theme="light"] .quota-costrow input[type="number"] { background: #f6f9fc; }
+.quota-chart-wrap { position: relative; margin-bottom: 16px; }
+#quotaChart { display: block; width: 100%; cursor: crosshair; }
+.quota-tip { position: absolute; z-index: 5; background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 8px 12px; font-size: 12px; line-height: 1.6; pointer-events: none; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35); white-space: nowrap; }
+.quota-tip[hidden] { display: none; }
+.quota-tip-day { font-weight: 700; margin-bottom: 2px; }
+.card-subtitle { font-size: 14px; font-weight: 700; margin: 18px 0 10px; }
 
 /* Phase P1: long/short positioning bar under the chart */
 .ls-bar { margin-top: 10px; }

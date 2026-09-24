@@ -125,8 +125,13 @@ class RecoveryService:
     def __init__(self, repository: SignalRepository) -> None:
         self.repository = repository
 
-    def recover(self) -> RecoveryResult:
+    def recover(self, symbol: str | None = None) -> RecoveryResult:
         """Determine the startup trading state from SQLite (read-only).
+
+        Args:
+            symbol: when given, only this symbol's actives are considered
+                (plan B': each daemon recovers its own symbol from a shared
+                DB). ``None`` keeps the legacy global behavior.
 
         Returns:
             RecoveryResult: ``RECOVERED_OPEN`` (with the active signal, whose
@@ -141,6 +146,9 @@ class RecoveryService:
             return RecoveryResult.error(f"failed to read the active signal: {exc}")
 
         active = pending + opened
+        if symbol is not None:
+            active = [signal for signal in active if signal.symbol == symbol]
+
         if not active:
             logger.info("recovery: no active signal; analysis may be scheduled later")
             return RecoveryResult.no_open_signal()

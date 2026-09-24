@@ -18,6 +18,7 @@ Correctness contract
 
 from __future__ import annotations
 
+from binance.market_data import validate_symbol
 from database.database import SignalRepository
 from database.models import (
     ACTIVE_STATUSES,
@@ -37,6 +38,10 @@ class SignalState:
     not be invoked and no new signal may be created. ``is_open()``/``open_signal()``
     keep their OPEN-only meaning (used by later position/demo phases); the engine
     and recovery drive the AI lock through ``is_active()``/``active_signal()``.
+
+    Plan B': the ``*_for_symbol`` variants scope the slot per symbol (one
+    active signal per symbol). The unsuffixed methods keep the legacy global
+    meaning for locks, CLI, and single-symbol compat.
     """
 
     def __init__(self, repository: SignalRepository) -> None:
@@ -46,9 +51,27 @@ class SignalState:
         """Return the current OPEN signal, or None when none is OPEN (always fresh)."""
         return self.repository.get_open_signal()
 
+    def open_signal_for(self, symbol: str) -> Signal | None:
+        """Return the OPEN signal for one symbol, or None (plan B')."""
+        return self.repository.get_open_signal_for_symbol(symbol)
+
     def active_signal(self) -> Signal | None:
         """Return the single active signal (PENDING_ENTRY or OPEN), or None."""
         return self.repository.get_active_signal()
+
+    def active_signal_for(self, symbol: object) -> Signal | None:
+        """Return the active signal for one symbol, or None (plan B').
+
+        A malformed symbol falls back to the global lookup (fail safe toward
+        blocking, never toward creating): the engine must never raise for a
+        bad analysis when it can safely report BLOCKED instead.
+        """
+        try:
+            return self.repository.get_active_signal_for_symbol(
+                validate_symbol(symbol)  # type: ignore[arg-type]
+            )
+        except Exception:
+            return self.repository.get_active_signal()
 
     def is_open(self) -> bool:
         """True when an OPEN signal exists (a confirmed, entry-touched position)."""

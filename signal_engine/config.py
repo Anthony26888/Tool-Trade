@@ -73,6 +73,9 @@ KEY_DEMO = "demo"
 KEY_TELEGRAM = "telegram"
 KEY_RUNTIME = "runtime"
 KEY_SYMBOL = "symbol"
+KEY_STRATEGY = "strategy"
+KEY_SYMBOLS = "symbols"
+KEY_QUOTA_COST = "quota_cost"
 
 #: Symbols selectable from the Settings page. Exactly one symbol is analysed at
 #: a time; switching only affects the NEXT analysis once the system is idle.
@@ -285,6 +288,44 @@ def _optional_str(payload: dict[str, Any], field: str) -> str:
     return str(value).strip() if value is not None else ""
 
 
+#: Strategy overlay fields: name -> (kind, minimum, maximum). Stored values
+#: are plain JSON (ints/floats/numeric strings); the validator layer coerces
+#: them with the same helpers as env vars.
+STRATEGY_FIELD_SPECS: dict[str, tuple[str, float, float]] = {
+    "min_confidence": ("int", 0, 100),
+    "min_risk_reward": ("decimal", 0, 10),
+    "fee_rate": ("decimal", 0, 0.01),
+    "pending_expiry_hours": ("float", 0, 168),
+    "max_funding_rate": ("decimal", 0, 0.05),
+    "htf_bias": ("int", 0, 1),
+    "warn_hours": ("float", 0, 168),
+}
+
+
+def _validate_strategy_field(
+    field: str, value: Any, kind: str, minimum: float, maximum: float
+) -> Any:
+    """Validate one strategy value; return the normalized storable form."""
+    if isinstance(value, bool):
+        number: Any = 1 if value else 0
+    else:
+        try:
+            number = float(str(value).strip() if isinstance(value, str) else value)
+        except (TypeError, ValueError) as exc:
+            raise SettingsValidationError(f"{field} must be a number") from exc
+    if not number == number or abs(number) == float("inf"):
+        raise SettingsValidationError(f"{field} must be a finite number")
+    if not (minimum <= number <= maximum):
+        raise SettingsValidationError(
+            f"{field} must be between {minimum:g} and {maximum:g}"
+        )
+    if kind == "int":
+        return int(number)
+    if kind == "decimal":
+        return str(number)
+    return float(number)
+
+
 def _float_setting(payload: dict[str, Any], field: str, default: float) -> float:
     value = payload.get(field)
     if value is None or str(value).strip() == "":
@@ -385,6 +426,26 @@ def validate_symbol_setting(value: Any) -> str:
     return symbol
 
 
+def validate_symbols_setting(value: Any) -> list[str]:
+    """Normalize + validate the multi-symbol combo (plan B').
+
+    Accepts a list of 1..N symbols from :data:`SUPPORTED_SYMBOLS`, deduped
+    with order preserved. Raises :class:`SettingsValidationError` when empty
+    or containing an unsupported symbol.
+    """
+    if not isinstance(value, list) or not value:
+        raise SettingsValidationError(
+            "symbols must be a non-empty list of "
+            f"{', '.join(SUPPORTED_SYMBOLS)}"
+        )
+    cleaned: list[str] = []
+    for item in value:
+        symbol = validate_symbol_setting(item)
+        if symbol not in cleaned:
+            cleaned.append(symbol)
+    return cleaned
+
+
 # -- Demo settings -----------------------------------------------------------------
 
 
@@ -483,6 +544,9 @@ class ConfigService:
             "symbol": self.get_symbol_public(),
             "demo": self.get_demo_public(),
             "telegram": self.get_telegram_public(),
+            "strategy": self.get_strategy_public(),
+            "symbols": self.get_symbols_public(),
+            "quota_cost": self.get_quota_cost_public(),
             "runtime": self.get_runtime_public(),
             "audit": self.get_audit(limit=20),
         }
@@ -726,6 +790,118 @@ class ConfigService:
             "updated_at": (stored or {}).get("updated_at"),
         }
 
+    def resolve_daemon_symbol(self) -> str:
+        """The symbol THIS daemon process analyses (plan B' fix).
+
+        Single-symbol deployments (no multi combo stored) behave exactly like
+        :meth:`resolve_symbol` (DB single > env > default). When a multi combo
+        (>1 symbols) is stored, the shared DB single must NOT override the
+        per-process env symbol — otherwise every daemon on the shared DB
+        would analyse the same symbol. Never raises: falls back to the legacy
+        path and then the default on any failure.
+        """
+        try:
+            stored = self._stored_json(KEY_SYMBOLS) or {}
+            raw = stored.get("symbols")
+            combo = [
+                str(item).strip().upper()
+                for item in raw
+                if isinstance(item, str)
+                and str(item).strip().upper() in SUPPORTED_SYMBOLS
+            ]
+            if len(combo) > 1:
+                env_value = str(self.env.get("BTCUSDT_SYMBOL", "") or "").strip().upper()
+                if env_value in SUPPORTED_SYMBOLS:
+                    return env_value
+                return DEFAULT_SYMBOL
+            return self.resolve_symbol()
+        except Exception:
+            try:
+                return self.resolve_symbol()
+            except Exception:
+                return DEFAULT_SYMBOL
+
+    def get_symbols_public(self) -> dict[str, Any]:
+        """Effective multi-symbol combo for the supervisor (plan B').
+
+        Falls back to the legacy single symbol (``[resolve_symbol()]``) when
+        no combo was ever saved, so fresh installs behave exactly as before.
+        """
+        stored = self._stored_json(KEY_SYMBOLS) or {}
+        raw = stored.get("symbols")
+        symbols: list[str] = []
+        if isinstance(raw, list):
+            for item in raw:
+                if (
+                    isinstance(item, str)
+                    and item.strip().upper() in SUPPORTED_SYMBOLS
+                    and item.strip().upper() not in symbols
+                ):
+                    symbols.append(item.strip().upper())
+        if not symbols:
+            symbols = [self.resolve_symbol()]
+        return {
+            "symbols": symbols,
+            "supported": list(SUPPORTED_SYMBOLS),
+            "updated_at": stored.get("updated_at"),
+        }
+
+    def update_symbols(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Persist the enabled symbol combo for the supervisor (plan B').
+
+        Never locked: enabling/disabling a symbol only affects FUTURE daemon
+        processes (the supervisor refuses to stop a symbol holding an OPEN
+        position). An OPEN position keeps its own monitor untouched.
+        """
+        if not isinstance(payload, dict):
+            raise SettingsValidationError("symbols body must be a JSON object")
+        symbols = validate_symbols_setting(payload.get("symbols"))
+        record = {"symbols": symbols, "updated_at": iso_utc_now()}
+        self._repo.set(KEY_SYMBOLS, json.dumps(record))
+        self._audit(
+            "symbols",
+            "update",
+            f"Enabled trading symbols set to {', '.join(symbols)}.",
+        )
+        logger.info("[Config] enabled symbols set to %s", symbols)
+        return self.get_symbols_public()
+
+    def get_quota_cost_public(self) -> dict[str, Any]:
+        """Price per LLM request (VND) for quota cost estimates.
+
+        Display-only estimate basis (not the provider invoice): cost = calls ×
+        price. Zero/empty means unset — the UI then shows "—" for money.
+        """
+        stored = self._stored_json(KEY_QUOTA_COST) or {}
+        try:
+            price = float(stored.get("per_call_vnd", 0) or 0)
+            if price != price or price < 0:
+                price = 0.0
+        except (TypeError, ValueError):
+            price = 0.0
+        return {"per_call_vnd": price, "updated_at": stored.get("updated_at")}
+
+    def update_quota_cost(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Persist the per-request price (VND >= 0). Never locked."""
+        if not isinstance(payload, dict):
+            raise SettingsValidationError("quota_cost body must be a JSON object")
+        unknown = sorted(set(payload) - {"per_call_vnd"})
+        if unknown:
+            raise SettingsValidationError(
+                f"unknown quota_cost field(s): {', '.join(unknown)}"
+            )
+        raw = payload.get("per_call_vnd", 0)
+        try:
+            price = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise SettingsValidationError("per_call_vnd must be a number") from exc
+        if not (price == price) or price < 0 or price > 1000000:
+            raise SettingsValidationError("per_call_vnd must be between 0 and 1000000")
+        record = {"per_call_vnd": price, "updated_at": iso_utc_now()}
+        self._repo.set(KEY_QUOTA_COST, json.dumps(record))
+        self._audit("quota_cost", "update", f"Quota price set to {price:g} VND/request.")
+        return self.get_quota_cost_public()
+
     def update_symbol(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Persist the analysed symbol for FUTURE analyses.
 
@@ -886,6 +1062,75 @@ class ConfigService:
             fee_rate=config.fee_rate,
         )
         logger.info("[Config] demo account %s config updated for future trades", row["id"])
+
+    def get_strategy_public(self) -> dict[str, Any]:
+        """Effective strategy knobs: stored Settings > env > code defaults.
+
+        Never locked while a signal is active: guardrails gate NEW signals
+        only, and an OPEN position's entry/TP/SL are immutable, so a save
+        applies to the next candle with no restart and no position impact.
+        """
+        from .validator import GuardrailConfig
+
+        stored = self._stored_json(KEY_STRATEGY) or {}
+        effective = GuardrailConfig.from_stored(stored, self.env)
+        warn_default = 12.0
+        try:
+            from .event_calendar import warn_hours_from_env
+
+            warn_default = warn_hours_from_env()
+        except Exception:
+            pass
+        warn_raw = stored.get("warn_hours", None)
+        try:
+            warn_hours = (
+                float(warn_raw)
+                if warn_raw is not None and str(warn_raw).strip() != ""
+                else warn_default
+            )
+        except (TypeError, ValueError):
+            warn_hours = warn_default
+        return {
+            "min_confidence": effective.min_confidence,
+            "min_risk_reward": str(effective.min_risk_reward),
+            "fee_rate": str(effective.fee_rate),
+            "pending_expiry_hours": effective.pending_expiry_hours,
+            "max_funding_rate": str(effective.max_funding_rate),
+            "htf_bias": effective.htf_bias,
+            "warn_hours": warn_hours,
+            "updated_at": stored.get("updated_at"),
+        }
+
+    def update_strategy(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Validate and persist the strategy overlay (partial updates merge)."""
+        if not isinstance(payload, dict):
+            raise SettingsValidationError("strategy body must be a JSON object")
+        if payload.get("reset") is True:
+            self._repo.delete(KEY_STRATEGY)
+            self._audit("strategy", "reset", "Strategy overlay cleared; .env/defaults effective.")
+            return self.get_strategy_public()
+        unknown = sorted(set(payload) - set(STRATEGY_FIELD_SPECS))
+        if unknown:
+            raise SettingsValidationError(
+                f"unknown strategy field(s): {', '.join(unknown)}"
+            )
+        stored = self._stored_json(KEY_STRATEGY) or {}
+        record = dict(stored)
+        changed: list[str] = []
+        for field, (kind, minimum, maximum) in STRATEGY_FIELD_SPECS.items():
+            if field not in payload:
+                continue
+            record[field] = _validate_strategy_field(field, payload[field], kind, minimum, maximum)
+            changed.append(field)
+        record["updated_at"] = iso_utc_now()
+        self._repo.set(KEY_STRATEGY, json.dumps(record))
+        self._audit(
+            "strategy",
+            "update",
+            f"Strategy settings updated ({', '.join(changed) if changed else 'no changes'}). "
+            "Applies from the next candle; open positions are unaffected.",
+        )
+        return self.get_strategy_public()
 
     def update_telegram(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Validate and persist the Telegram notification settings (no token echoes)."""

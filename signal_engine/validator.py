@@ -26,16 +26,20 @@ Rules
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any
 
-from database.database import to_decimal, validate_signal_prices
+from database.database import ConfigRepository, to_decimal, validate_signal_prices
 from database.models import SignalValidationError
 
 from .analysis import DECISIONS, SignalAnalysis
+
+logger = logging.getLogger(__name__)
 
 _CONFIDENCE_MIN = 0
 _CONFIDENCE_MAX = 100
@@ -133,10 +137,86 @@ class GuardrailConfig:
             htf_bias=_env_int(source, ENV_HTF_BIAS, DEFAULT_HTF_BIAS),
         )
 
+    @classmethod
+    def from_stored(
+        cls, stored: Mapping[str, Any] | None, env: Mapping[str, Any] | None = None
+    ) -> GuardrailConfig:
+        """Build with stored Settings overlaying env (missing keys fall back).
+
+        Precedence per key: stored document > env vars > code defaults.
+        A missing/empty/non-mapping document resolves exactly like
+        :meth:`from_env`, so fresh installs behave identically.
+        """
+        base = cls.from_env(env)
+        if not isinstance(stored, Mapping) or not stored:
+            return base
+        return cls(
+            min_confidence=_env_int(stored, "min_confidence", base.min_confidence),
+            min_risk_reward=_env_decimal(
+                stored, "min_risk_reward", base.min_risk_reward
+            ),
+            fee_rate=_env_decimal(stored, "fee_rate", base.fee_rate),
+            pending_expiry_hours=_env_float(
+                stored, "pending_expiry_hours", base.pending_expiry_hours
+            ),
+            max_funding_rate=_env_decimal(
+                stored, "max_funding_rate", base.max_funding_rate
+            ),
+            htf_bias=_env_int(stored, "htf_bias", base.htf_bias),
+        )
+
 
 def default_guardrails(env: Mapping[str, Any] | None = None) -> GuardrailConfig:
     """Resolve the active guardrails (env vars, read per call, no caching)."""
     return GuardrailConfig.from_env(env)
+
+
+#: Settings namespace holding the strategy overlay document.
+STRATEGY_NAMESPACE = "strategy"
+
+#: Strategy document keys (subset of GuardrailConfig fields) + warn hours.
+STRATEGY_KEYS = (
+    "min_confidence",
+    "min_risk_reward",
+    "fee_rate",
+    "pending_expiry_hours",
+    "max_funding_rate",
+    "htf_bias",
+    "warn_hours",
+)
+
+
+def read_stored_strategy(database: Any) -> dict[str, Any]:
+    """Stored strategy overlay document ({} when absent/broken; never raises)."""
+    try:
+        if database is None:
+            return {}
+        raw = ConfigRepository(database).get(STRATEGY_NAMESPACE)
+        if not raw:
+            return {}
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        logger.warning("[Validator] stored strategy read failed: %s", exc)
+        return {}
+
+
+def read_stored_warn_hours(database: Any) -> float | None:
+    """Stored pre-event warn hours (None = use env default; never raises)."""
+    try:
+        stored = read_stored_strategy(database)
+        raw = stored.get("warn_hours", None)
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            return None
+        value = float(raw)
+        if value != value or value < 0:
+            return None
+        return value
+    except (TypeError, ValueError):
+        return None
+    except Exception as exc:
+        logger.warning("[Validator] stored warn-hours read failed: %s", exc)
+        return None
 
 
 @dataclass(frozen=True)

@@ -28,9 +28,9 @@ from database.database import (
     RuntimeStateRepository,
     SignalRepository,
 )
-from database.models import STATUS_OPEN, STATUS_TP_HIT
+from database.models import STATUS_OPEN, STATUS_SL_HIT, STATUS_TP_HIT
 from demo.executor import DemoExecutor
-from signal_engine.config import ConfigService
+from signal_engine.config import ConfigService, SettingsValidationError
 from web.server import WebApplication, WebServer
 
 
@@ -260,6 +260,33 @@ class WebApiTestCase(unittest.TestCase):
         self.assertEqual(len(signals["signals"]), 1)
         self.assertEqual(signals["signals"][0]["status"], "PENDING_ENTRY")
 
+    def test_dashboard_positions_list(self):
+        self.seed_demo_account()
+        sig_id = self.seed_active_signal()
+        _, data = self.get_json("/api/dashboard")
+        positions = data["positions"]
+        self.assertEqual(len(positions), 1)
+        item = positions[0]
+        self.assertEqual(item["signal"]["id"], sig_id)
+        self.assertEqual(item["signal"]["symbol"], "BTCUSDT")
+        self.assertIsNone(item["position"])
+        self.assertIsNone(item["unrealized"])
+        # Backward-compatible singular keys stay intact.
+        self.assertEqual(data["active_signal"]["id"], sig_id)
+        # A second active row (post-B1 multi-symbol state, inserted raw)
+        # appears in the list with its own position block.
+        with self.db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO signals (symbol, timeframe, direction, entry, "
+                "stop_loss, take_profit, status, created_at) VALUES "
+                "('ETHUSDT', '1h', 'SHORT', '3500', '3600', '3400', "
+                "'PENDING_ENTRY', '2026-09-20T00:00:00.000Z')"
+            )
+        _, data = self.get_json("/api/dashboard")
+        self.assertEqual(len(data["positions"]), 2)
+        symbols = sorted(p["signal"]["symbol"] for p in data["positions"])
+        self.assertEqual(symbols, ["BTCUSDT", "ETHUSDT"])
+
         _, trades = self.get_json("/api/trades?limit=10")
         self.assertEqual(trades["count"], 0)
         self.assertEqual(trades["trades"], [])
@@ -267,6 +294,78 @@ class WebApiTestCase(unittest.TestCase):
         _, stats = self.get_json("/api/statistics")
         self.assertEqual(stats["account"]["leverage"], 10)
         self.assertIsNotNone(stats["statistics"])
+
+    def test_trades_carry_position_symbol(self):
+        from database.database import DemoRepository
+
+        self.seed_demo_account()
+        demo = DemoRepository(self.db)
+        account = demo.get_account("demo")
+        repo = SignalRepository(self.db)
+        seen = {}
+        for symbol in ("BTCUSDT", "ETHUSDT"):
+            sig = repo.create_signal(
+                symbol, "1h", "LONG", Decimal("100.00"), Decimal("99.00"), Decimal("101.00")
+            )
+            repo.transition_signal(sig.id, STATUS_OPEN)
+            repo.transition_signal(
+                sig.id, STATUS_TP_HIT, close_price="101.00", result="WIN"
+            )
+            pos = demo.create_position(
+                account_id=account["id"],
+                signal_id=sig.id,
+                symbol=symbol,
+                side="LONG",
+                entry_price=Decimal("100"),
+                quantity=Decimal("5"),
+                position_size=Decimal("500"),
+                margin=Decimal("50"),
+                leverage=10,
+                stop_loss=Decimal("99.00"),
+                take_profit=Decimal("101.00"),
+            )
+            demo.record_trade(
+                position_id=pos["id"],
+                signal_id=sig.id,
+                account_id=account["id"],
+                side="LONG",
+                entry_price=Decimal("100"),
+                exit_price=Decimal("101.00"),
+                quantity=Decimal("5"),
+                margin=Decimal("50"),
+                position_size=Decimal("500"),
+                leverage=10,
+                gross_pnl=Decimal("5"),
+                fee=Decimal("0.20"),
+                net_pnl=Decimal("4.80"),
+                pnl_percent=Decimal("0.96"),
+                result="WIN",
+            )
+            seen[sig.id] = symbol
+        _, data = self.get_json("/api/trades?limit=10")
+        got = {t["signal_id"]: t["symbol"] for t in data["trades"]}
+        self.assertEqual(got, seen)
+        for t in data["trades"]:
+            self.assertEqual(t["leverage"], 10)
+            self.assertTrue(t["opened_at"])
+            self.assertTrue(t["closed_at"])
+
+    def test_signals_and_daemon_rows_carry_symbol(self):
+        repo = SignalRepository(self.db)
+        sig_id = repo.create_signal(
+            "ETHUSDT", "1h", "SHORT", Decimal("100.00"), Decimal("101.00"), Decimal("99.00")
+        ).id
+        _, signals = self.get_json("/api/signals?limit=10")
+        row = next(s for s in signals["signals"] if s["id"] == sig_id)
+        self.assertEqual(row["symbol"], "ETHUSDT")
+        clog = CandleLogRepository(self.db)
+        clog.upsert(
+            symbol="ETHUSDT", timeframe="1h", candle_timestamp_ms=1_720_000_000_000,
+            outcome="WAIT", decision="WAIT",
+        )
+        _, data = self.get_json("/api/daemon-log?limit=10")
+        entry = next(r for r in data["rows"] if r["candle_timestamp_ms"] == 1_720_000_000_000)
+        self.assertEqual(entry["symbol"], "ETHUSDT")
 
     # -- signals filters + delete -------------------------------------------------
 
@@ -616,6 +715,32 @@ class WebApiTestCase(unittest.TestCase):
         status, raw = _request(self.base + "/api/daemon-log?decision=ROCKET")
         self.assertEqual(status, 400)
 
+    def test_delete_daemon_log_rows_by_ids(self):
+        repo = CandleLogRepository(self.db)
+        for ts in (1_720_000_000_000, 1_720_003_600_000, 1_720_007_200_000):
+            repo.upsert(
+                symbol="BTCUSDT", timeframe="1h", candle_timestamp_ms=ts,
+                outcome="WAIT", decision="WAIT",
+            )
+        _, data = self.get_json("/api/daemon-log?limit=10")
+        ids = sorted(r["id"] for r in data["rows"])
+        self.assertEqual(len(ids), 3)
+        status, raw = _request(
+            self.base + "/api/daemon-log", method="DELETE",
+            body={"ids": [ids[0], ids[2], 999999, -5, "x", True]},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw)["deleted"], 2)
+        _, data = self.get_json("/api/daemon-log?limit=10")
+        self.assertEqual([r["id"] for r in data["rows"]], [ids[1]])
+        # Empty selection is a no-op; missing body still clears all.
+        status, raw = _request(
+            self.base + "/api/daemon-log", method="DELETE", body={"ids": []}
+        )
+        self.assertEqual(json.loads(raw)["cleared"], 1)
+        _, data = self.get_json("/api/daemon-log?limit=10")
+        self.assertEqual(data["rows"], [])
+
     def test_daemon_log_indicator_json_is_parsed(self):
         repo = CandleLogRepository(self.db)
         repo.upsert(
@@ -763,6 +888,27 @@ class ChartApiTestCase(unittest.TestCase):
         self.assertFalse(body["ok"])
         self.assertIn("interval", body["error"])
         self.assertEqual(self.market.calls, [])
+
+    def test_chart_symbol_param_scopes_data_and_overlay(self):
+        self.seed_active_signal()
+        data = self.get_json("/api/chart?interval=1h&limit=30&symbol=ETHUSDT")
+        self.assertEqual(data["chart"]["overlay"], {})
+        self.assertIn(("ETHUSDT", "1h", 30), self.market.calls)
+        data = self.get_json("/api/chart?interval=1h&limit=30&symbol=BTCUSDT")
+        overlay = data["chart"]["overlay"]
+        self.assertTrue(overlay["has_signal"])
+        self.assertEqual(overlay["direction"], "LONG")
+
+    def test_chart_rejects_unknown_symbol(self):
+        status, raw = _request(self.base + "/api/chart?symbol=DOGE")
+        self.assertEqual(status, 400)
+        body = json.loads(raw)
+        self.assertFalse(body["ok"])
+        self.assertIn("symbol", body["error"].lower())
+
+    def test_dashboard_includes_symbols_combo(self):
+        data = self.get_json("/api/dashboard")
+        self.assertEqual(data["symbols"], ["BTCUSDT"])
 
     def test_chart_maps_binance_failure_to_502(self):
         failing = FakeMarketData(error=BinanceConnectionError("socket timeout"))
@@ -1066,22 +1212,27 @@ class ChartApiTestCase(unittest.TestCase):
         self.assertIn(".pager", css)
         if shutil.which("node") is None:
             self.skipTest("node is not installed")
-        start = js.index("function renderDaemonPager(")
-        depth = 0
-        for pos in range(start, len(js)):
-            if js[pos] == "{":
-                depth += 1
-            elif js[pos] == "}":
-                depth -= 1
-                if depth == 0:
-                    fn = js[start : pos + 1]
-                    break
+
+        def _extract_fn(name):
+            start = js.index(f"function {name}(")
+            depth = 0
+            for pos in range(start, len(js)):
+                if js[pos] == "{":
+                    depth += 1
+                elif js[pos] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return js[start : pos + 1]
+            raise AssertionError(f"unbalanced braces in {name}")
+
         program = (
             "let ddPage = 0;\n"
             "const DD_PAGE_SIZE = 50;\n"
             "let _el = null;\n"
             "const $ = () => _el;\n"
-            + fn + "\n"
+            "const t = (k, vs) => { let s = {'pager.prev': '‹ Prev', 'pager.next': 'Next ›', 'pager.label': 'Page {n} · rows {from}'}[k] || k; "
+            "if (vs) for (const [kk, vv] of Object.entries(vs)) s = s.split('{' + kk + '}').join(vv); return s; };\n"
+            + _extract_fn("pagerHtml") + "\n" + _extract_fn("renderDaemonPager") + "\n"
             "const out = [];\n"
             "const snap = () => ({ hidden: _el.hidden, html: _el.innerHTML });\n"
             "_el = { hidden: false, innerHTML: '' };\n"
@@ -1107,17 +1258,171 @@ class ChartApiTestCase(unittest.TestCase):
         # First page with more: prev disabled, next enabled, label page 1.
         first = states["first-more"]
         self.assertFalse(first["hidden"])
-        self.assertIn("Trang 1", first["html"])
+        self.assertIn("Page 1", first["html"])
         self.assertIn('data-pg="prev" disabled', first["html"])
         self.assertNotIn('data-pg="next" disabled', first["html"])
         # Middle page: both enabled.
         mid = states["mid-more"]
-        self.assertIn("Trang 3", mid["html"])
+        self.assertIn("Page 3", mid["html"])
         self.assertNotIn("disabled", mid["html"])
         # Last page: next disabled, prev enabled.
         last = states["mid-last"]
         self.assertIn('data-pg="next" disabled', last["html"])
         self.assertNotIn('data-pg="prev" disabled', last["html"])
+
+    def test_position_cards_render(self):
+        import shutil
+        import subprocess
+
+        status, js = _request(self.base + "/static/app.js")
+        self.assertEqual(status, 200)
+        for marker in (
+            "renderPositionCards",
+            "pos-card",
+            "pos-grid",
+            "pos.waiting",
+            "dash.statusMulti",
+            "baseAsset",
+        ):
+            self.assertIn(marker, js)
+        if shutil.which("node") is None:
+            self.skipTest("node is not installed")
+
+        def _extract_fn(name):
+            start = js.index(f"function {name}(")
+            depth = 0
+            for pos in range(start, len(js)):
+                if js[pos] == "{":
+                    depth += 1
+                elif js[pos] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return js[start : pos + 1]
+            raise AssertionError(f"unbalanced braces in {name}")
+
+        helpers = "\n".join(
+            _extract_fn(n)
+            for n in (
+                "emptyBox",
+                "badge",
+                "escapeHtml",
+                "baseAsset",
+                "renderPositionCards",
+            )
+        )
+        stubs = (
+            "const fmtNum = (v, d) => Number(v).toFixed(d);\n"
+            "const fmtVn = (s) => s;\n"
+        )
+        program = (
+            "const window = { _symbol: 'BTCUSDT' };\n"
+            "const t = (k) => k;\n"
+            + stubs + helpers + "\n"
+            "const OPEN = {signal: {symbol: 'BTCUSDT', direction: 'SHORT', confidence: 75, entry: 80310, stop_loss: 81003, take_profit: 78067, model_name: 'm', analysis_timestamp: null},"
+            " position: {side: 'SHORT', quantity: 0.000955, margin: 10, position_size: 81.24, leverage: 50, symbol: 'BTCUSDT'},"
+            " position_outcomes: {take_profit: {net_pnl: 2.37}, stop_loss: {net_pnl: -1.07}},"
+            " unrealized: {gross_pnl: 0.92, pnl_percent: 9.2}};\n"
+            "const PENDING = {signal: {symbol: 'ETHUSDT', direction: 'LONG', confidence: 66, entry: 3500, stop_loss: 3450, take_profit: 3600, model_name: 'm', analysis_timestamp: null},"
+            " position: null, position_outcomes: null, unrealized: null};\n"
+            "const html = renderPositionCards([OPEN, PENDING]);\n"
+            "const empty = renderPositionCards([]);\n"
+            "console.log(JSON.stringify([html, empty]));"
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as handle:
+            handle.write(program)
+            path = handle.name
+        try:
+            proc = subprocess.run(
+                ["node", path], capture_output=True, text=True, timeout=60
+            )
+        finally:
+            os.unlink(path)
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr[-1000:])
+        html, empty = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertIn("pos-card short", html)
+        self.assertIn("BTCUSDT", html)
+        self.assertIn("+$0.92", html)
+        self.assertIn("pos.waiting", html)
+        self.assertIn("ETHUSDT", html)
+        self.assertIn("dash.noSignal", empty)
+        self.assertIn("pos-side", html)
+        self.assertIn("lev-chip", html)
+        self.assertIn(">50x<", html)
+        self.assertIn("pos-line entry", html)
+        self.assertIn("data-close-sid", html)
+        self.assertNotIn("pos-hero", html)
+        self.assertNotIn("pos-actions", html)
+
+    def test_portfolio_select_render(self):
+        import shutil
+        import subprocess
+
+        status, js = _request(self.base + "/static/app.js")
+        self.assertEqual(status, 200)
+        for marker in ("chartSymbol", "renderPortfolioBar", "id=\"chartSymbol\""):
+            self.assertIn(marker, js + _request(self.base + "/")[1])
+        self.assertIn("lastPortfolio", js)
+        status, css = _request(self.base + "/static/style.css")
+        self.assertEqual(status, 200)
+        self.assertIn(".portfolio-dot.ready", css)
+        self.assertIn(".pos-grid { display: grid; grid-template-columns: 1fr;", css)
+        if shutil.which("node") is None:
+            self.skipTest("node is not installed")
+
+        def _extract_fn(name):
+            start = js.index(f"function {name}(")
+            depth = 0
+            for pos in range(start, len(js)):
+                if js[pos] == "{":
+                    depth += 1
+                elif js[pos] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return js[start : pos + 1]
+            raise AssertionError(f"unbalanced braces in {name}")
+
+        program = (
+            "let chartSymbol = null;\n"
+            "let _el = null;\n"
+            "const $ = () => _el;\n"
+            "const t = (k) => k;\n"
+            "const escapeHtml = (s) => s;\n"
+            + _extract_fn("renderPortfolioBar") + "\n"
+            "_el = { hidden: true, innerHTML: '' };\n"
+            "renderPortfolioBar({symbols: [{symbol: 'BTCUSDT', state: 'OPEN'}, {symbol: 'ETHUSDT', state: 'SEEKING'}], full: false}, ['BTCUSDT', 'ETHUSDT']);\n"
+            "const mixed = _el.innerHTML;\n"
+            "const sel = chartSymbol;\n"
+            "chartSymbol = 'ETHUSDT';\n"
+            "renderPortfolioBar({symbols: [{symbol: 'BTCUSDT', state: 'OPEN'}, {symbol: 'ETHUSDT', state: 'OPEN'}], full: true}, ['BTCUSDT', 'ETHUSDT']);\n"
+            "const full = _el.innerHTML;\n"
+            "chartSymbol = 'XAUUSDT';\n"
+            "renderPortfolioBar({symbols: [{symbol: 'XAUUSDT', state: 'SEEKING'}], full: false}, ['XAUUSDT']);\n"
+            "const seeking = _el.innerHTML;\n"
+            "console.log(JSON.stringify([mixed, sel, full, seeking]));"
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as handle:
+            handle.write(program)
+            path = handle.name
+        try:
+            proc = subprocess.run(
+                ["node", path], capture_output=True, text=True, timeout=60
+            )
+        finally:
+            os.unlink(path)
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr[-1000:])
+        mixed, sel, full, seeking = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertIn('<option value="BTCUSDT" selected>', mixed)
+        self.assertIn('<option value="ETHUSDT">', mixed)
+        self.assertEqual(sel, "BTCUSDT")
+        # Chip follows the dropdown selection (BTC holding -> amber, no ETH chip).
+        self.assertIn("BTCUSDT", mixed)
+        self.assertIn("portfolio-dot holding", mixed)
+        self.assertNotIn("ETHUSDT</strong>", mixed)
+        self.assertIn("port.full", full)
+        # Seeking chip follows selection with the green ready dot, exactly once.
+        self.assertIn("XAUUSDT", seeking)
+        self.assertIn("portfolio-dot ready", seeking)
+        self.assertEqual(seeking.count("XAUUSDT</strong>"), 1)
 
     def test_static_signals_pager(self):
         import shutil
@@ -1130,26 +1435,38 @@ class ChartApiTestCase(unittest.TestCase):
             "renderSignalsPager",
             "sigPage = 0",
             "signalsPager",
+            "dd-check",
+            "ddSelAll",
+            "ddDeleteSel",
+            "updateDdDeleteCount",
+            "daemon.selectAll",
+            "daemon.deleteSel",
+            "daemon.confirmDelSel",
         ):
             self.assertIn(marker, js)
         if shutil.which("node") is None:
             self.skipTest("node is not installed")
-        start = js.index("function renderSignalsPager(")
-        depth = 0
-        for pos in range(start, len(js)):
-            if js[pos] == "{":
-                depth += 1
-            elif js[pos] == "}":
-                depth -= 1
-                if depth == 0:
-                    fn = js[start : pos + 1]
-                    break
+
+        def _extract_fn(name):
+            start = js.index(f"function {name}(")
+            depth = 0
+            for pos in range(start, len(js)):
+                if js[pos] == "{":
+                    depth += 1
+                elif js[pos] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return js[start : pos + 1]
+            raise AssertionError(f"unbalanced braces in {name}")
+
         program = (
             "let sigPage = 0;\n"
             "const SIG_PAGE_SIZE = 25;\n"
             "let _el = null;\n"
             "const $ = () => _el;\n"
-            + fn + "\n"
+            "const t = (k, vs) => { let s = {'pager.prev': '‹ Prev', 'pager.next': 'Next ›', 'pager.label': 'Page {n} · rows {from}'}[k] || k; "
+            "if (vs) for (const [kk, vv] of Object.entries(vs)) s = s.split('{' + kk + '}').join(vv); return s; };\n"
+            + _extract_fn("pagerHtml") + "\n" + _extract_fn("renderSignalsPager") + "\n"
             "_el = { hidden: false, innerHTML: '' };\n"
             "sigPage = 0; renderSignalsPager(false);\n"
             "const hidden = _el.hidden;\n"
@@ -1169,8 +1486,55 @@ class ChartApiTestCase(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, msg=proc.stderr[-1000:])
         hidden, mid = json.loads(proc.stdout.strip().splitlines()[-1])
         self.assertTrue(hidden)
-        self.assertIn("Trang 2", mid)
-        self.assertNotIn("disabled", mid)
+        self.assertIn("Page 2", mid)
+
+    def test_dd_delete_count_logic(self):
+        import shutil
+        import subprocess
+
+        status, js = _request(self.base + "/static/app.js")
+        self.assertEqual(status, 200)
+        if shutil.which("node") is None:
+            self.skipTest("node is not installed")
+
+        def _extract_fn(name):
+            start = js.index(f"function {name}(")
+            depth = 0
+            for pos in range(start, len(js)):
+                if js[pos] == "{":
+                    depth += 1
+                elif js[pos] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return js[start : pos + 1]
+            raise AssertionError(f"unbalanced braces in {name}")
+
+        program = (
+            "let CHECKED = 0;\n"
+            "const BTN = { disabled: true, textContent: '' };\n"
+            "const document = { querySelectorAll: (sel) => Array.from({length: CHECKED}, () => ({})) };\n"
+            "const $ = (sel) => BTN;\n"
+            "const t = (k, vs) => k === 'daemon.deleteSel' ? `Delete selected (${vs.n})` : k;\n"
+            + _extract_fn("ddSelectedCount") + "\n" + _extract_fn("updateDdDeleteCount") + "\n"
+            "CHECKED = 0; updateDdDeleteCount();\n"
+            "const dis0 = BTN.disabled;\n"
+            "CHECKED = 3; updateDdDeleteCount();\n"
+            "console.log(JSON.stringify([dis0, BTN.disabled, BTN.textContent]));"
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as handle:
+            handle.write(program)
+            path = handle.name
+        try:
+            proc = subprocess.run(
+                ["node", path], capture_output=True, text=True, timeout=60
+            )
+        finally:
+            os.unlink(path)
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr[-1000:])
+        dis0, dis3, label = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertTrue(dis0)
+        self.assertFalse(dis3)
+        self.assertEqual(label, "Delete selected (3)")
 
     def test_static_daemon_detail_sections(self):
         status, raw = _request(self.base + "/static/app.js")
@@ -1251,14 +1615,19 @@ class ChartApiTestCase(unittest.TestCase):
         status, raw = _request(self.base + "/static/app.js")
         self.assertEqual(status, 200)
         for marker in (
-            "<th>Calls</th>",
-            'data-label="Calls"',
-            'colspan="10"',
-            "Tokens in/out/total",
+            't("daemon.thCalls")',
+            'data-label="${t("daemon.thCalls")}"',
+            'colspan="11"',
+            "daemon.kTokens",
+            "daemon.kTokensEst",
+            "tokens_estimated",
             "ddLevelsSection",
             "ddQuotaSection",
             "ddIndicatorsSection",
             "ddRiskReward",
+            "daemon.thSymbol",
+            "sig.thSymbol",
+            "trades.thSymbol",
         ):
             self.assertIn(marker, raw)
 
@@ -1423,6 +1792,118 @@ class SignalChatApiTestCase(unittest.TestCase):
         status, raw = _request(self.base + "/static/app.js")
         self.assertEqual(status, 200)
         self.assertIn("renderAudit", raw)
+
+
+class ManualCloseApiTestCase(unittest.TestCase):
+    """POST /api/positions/:id/close ("Chốt"): OPEN only, market price exit,
+    TP_HIT/SL_HIT by PnL sign with close_reason=MANUAL (no schema change)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db = Database(os.path.join(self._tmp.name, "web.db"))
+        self.db.initialize()
+        self.market = FakeMarketData()
+        self.app = WebApplication(
+            self.db,
+            market_data=self.market,
+            config_service=ConfigService(
+                self.db,
+                secrets_path=os.path.join(self._tmp.name, "secrets.json"),
+                env={},
+                transport_get=lambda url, timeout: FakeResponse(
+                    200, {"models": [{"name": "qwen3:4b"}]}
+                ),
+            ),
+        )
+        self.server = WebServer(self.app, host="127.0.0.1", port=0)
+        self.server.start()
+        self.base = f"http://127.0.0.1:{self.server.bound_port}"
+        self.signals = SignalRepository(self.db)
+
+    def tearDown(self) -> None:
+        self.server.stop()
+        self._tmp.cleanup()
+
+    def seed_open(self, direction: str = "LONG") -> int:
+        stop, take = (Decimal("99.00"), Decimal("101.00")) if direction == "LONG" else (Decimal("101.00"), Decimal("99.00"))
+        sig = self.signals.create_signal(
+            "BTCUSDT", "1h", direction, Decimal("100.00"), stop, take
+        )
+        opened = self.signals.transition_signal(sig.id, STATUS_OPEN)
+        position = DemoExecutor(self.db).open_position(opened)
+        self.assertIsNotNone(position)
+        return sig.id
+
+    def test_close_profitable_long_lands_tp_hit_manual(self):
+        sid = self.seed_open("LONG")  # market 100.5 >= entry 100
+        before = DemoRepository(self.db).get_account("demo")
+        payload = self.app.close_position(sid)
+        self.assertEqual(payload["status"], STATUS_TP_HIT)
+        self.assertEqual(payload["close_reason"], "MANUAL")
+        self.assertEqual(payload["result"], "WIN")
+        self.assertAlmostEqual(payload["close_price"], 100.5)
+        self.assertGreater(payload["trade"]["net_pnl"], 0)
+        after = DemoRepository(self.db).get_account("demo")
+        self.assertGreater(after["balance"], before["balance"])
+        row = self.signals.get_signal(sid)
+        self.assertEqual(row.status, STATUS_TP_HIT)
+        trade = DemoRepository(self.db).get_trade_for_signal(sid)
+        self.assertIsNotNone(trade)
+        self.assertEqual(trade["result"], "WIN")
+
+    def test_close_losing_short_lands_sl_hit_manual(self):
+        sid = self.seed_open("SHORT")  # market 100.5 > entry 100: SHORT loses
+        payload = self.app.close_position(sid)
+        self.assertEqual(payload["status"], STATUS_SL_HIT)
+        self.assertEqual(payload["close_reason"], "MANUAL")
+        self.assertEqual(payload["result"], "LOSS")
+        self.assertLess(payload["trade"]["net_pnl"], 0)
+
+    def test_close_rejects_non_open(self):
+        sig = self.signals.create_signal(
+            "BTCUSDT", "1h", "LONG", Decimal("100.00"), Decimal("99.00"), Decimal("101.00")
+        )
+        with self.assertRaises(SettingsValidationError):
+            self.app.close_position(sig.id)
+
+    def test_close_rejects_unknown_id(self):
+        with self.assertRaises(SettingsValidationError):
+            self.app.close_position(9999)
+        with self.assertRaises(SettingsValidationError):
+            self.app.close_position("abc")
+
+    def test_close_rejects_open_without_position(self):
+        sig = self.signals.create_signal(
+            "BTCUSDT", "1h", "LONG", Decimal("100.00"), Decimal("99.00"), Decimal("101.00")
+        )
+        self.signals.transition_signal(sig.id, STATUS_OPEN)
+        with self.assertRaises(SettingsValidationError):
+            self.app.close_position(sig.id)
+
+    def test_close_fails_when_price_unavailable_and_stays_open(self):
+        sid = self.seed_open("LONG")
+        self.market._error = BinanceConnectionError("down")
+        self.app._price_cache = None
+        with self.assertRaises(SettingsValidationError):
+            self.app.close_position(sid)
+        self.assertEqual(self.signals.get_signal(sid).status, STATUS_OPEN)
+
+    def test_close_twice_reports_already_closed(self):
+        sid = self.seed_open("LONG")
+        self.app.close_position(sid)
+        with self.assertRaisesRegex(SettingsValidationError, "only OPEN"):
+            self.app.close_position(sid)
+
+    def test_close_http_route(self):
+        sid = self.seed_open("LONG")
+        status, raw = _request(f"{self.base}/api/positions/{sid}/close", method="POST")
+        self.assertEqual(status, 200)
+        body = json.loads(raw)
+        self.assertEqual(body["close"]["status"], STATUS_TP_HIT)
+        self.assertEqual(body["close"]["close_reason"], "MANUAL")
+        status, raw = _request(f"{self.base}/api/positions/9999/close", method="POST")
+        self.assertEqual(status, 400)
+        self.assertFalse(json.loads(raw)["ok"])
 
 
 if __name__ == "__main__":  # pragma: no cover

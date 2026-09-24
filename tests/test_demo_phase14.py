@@ -308,9 +308,6 @@ class TestPositionClose(DemoExecutorTestCase):
                 net_pnl="0.6",
                 pnl_percent="1.2",
                 result="WIN",
-                next_balance="1000.6",
-                next_equity="1000.6",
-                next_peak_equity="1000.6",
             )
 
     def test_short_close_uses_short_pnl(self):

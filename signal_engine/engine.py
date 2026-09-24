@@ -60,12 +60,32 @@ from .analysis import SignalAnalysis
 from .state import SignalState
 from .validator import (
     GuardrailConfig,
-    default_guardrails,
+    read_stored_strategy,
     validate_analysis,
     validate_decision,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _live_guardrails(
+    repository: Any, guardrails: GuardrailConfig | None
+) -> GuardrailConfig:
+    """Resolve guardrails: explicit arg > stored Settings > env > defaults.
+
+    The stored overlay is re-read on every validation, so a Settings save
+    applies to the next candle with no restart. Backtests pass explicit
+    guardrails (or none, without a database) and are unaffected.
+    """
+    if guardrails is not None:
+        return guardrails
+    try:
+        database = getattr(repository, "database", None)
+        stored = read_stored_strategy(database) if database is not None else {}
+    except Exception as exc:
+        logger.warning("[Engine] stored strategy read failed: %s", exc)
+        stored = {}
+    return GuardrailConfig.from_stored(stored)
 
 
 def _pending_expired(active: Signal, expiry_hours: float) -> bool:
@@ -182,8 +202,8 @@ class SignalEngine:
         if decision == "WAIT":
             return SignalEngineResult.wait()
 
-        guards = guardrails if guardrails is not None else default_guardrails()
-        active = self.state.active_signal()
+        guards = _live_guardrails(self.repository, guardrails)
+        active = self.state.active_signal_for(analysis.symbol)
         if active is not None:
             if _pending_expired(active, guards.pending_expiry_hours):
                 try:
@@ -245,6 +265,7 @@ class SignalEngine:
         analyzer: Callable[[Any, Any], SignalAnalysis],
         *,
         guardrails: GuardrailConfig | None = None,
+        symbol: str | None = None,
     ) -> SignalEngineResult:
         """Gate the AI first, then analyze and create.
 
@@ -257,8 +278,12 @@ class SignalEngine:
         ``signal_engine.analysis.analyze_signal``). A race after the gate is
         still caught by the repository transaction.
         """
-        guards = guardrails if guardrails is not None else default_guardrails()
-        active = self.state.active_signal()
+        guards = _live_guardrails(self.repository, guardrails)
+        active = (
+            self.state.active_signal_for(symbol)
+            if symbol is not None
+            else self.state.active_signal()
+        )
         if active is not None:
             if _pending_expired(active, guards.pending_expiry_hours):
                 try:

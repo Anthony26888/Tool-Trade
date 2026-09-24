@@ -205,6 +205,22 @@ class EventCalendar:
     def source(self) -> str:
         return self._source
 
+    def override_warn_hours(self, value: float | None) -> None:
+        """Override the WARN horizon (Settings overlay; None = keep current).
+
+        Called per scheduler tick so a Settings save applies with no restart.
+        Out-of-range values are ignored (fail safe towards the default).
+        """
+        try:
+            if value is None:
+                return
+            number = float(value)
+            if number != number or number < 0:
+                return
+            self._warn_hours = number
+        except (TypeError, ValueError):
+            return
+
     # -- refresh ----------------------------------------------------------
 
     def refresh(self, now_ms: int, *, force: bool = False) -> None:

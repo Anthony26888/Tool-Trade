@@ -1259,3 +1259,49 @@ Verify:
 Run all tests.
 
 Report final architecture and test results.
+
+---
+
+## PHASE B' — Multi-symbol, shared account (BTCUSDT + ETHUSDT + XAUUSDT)
+
+One shared DB/account/port; one daemon process per enabled symbol (each keeps
+the proven single-symbol loop). The global one-active rule becomes one slot
+PER SYMBOL.
+
+### Operating rules (locked)
+
+1. At most one active signal per symbol (PENDING_ENTRY counts as holding).
+2. A symbol with no active signal keeps analyzing; a holding symbol locks AI.
+3. All symbols holding → FULL: analysis idle everywhere, monitors keep watching.
+4. TP/SL monitoring NEVER pauses, including while FULL.
+5. Macro blackout pauses new entries on all symbols.
+6. Settings locks stay global while any OPEN exists.
+7. Deselecting a symbol holding OPEN is refused with an explicit message.
+8. Concurrent OPEN cap: MAX_OPEN_POSITIONS = 3 (defense in depth; slots bound it).
+
+### Implementation (B1–B4, all verified)
+
+- B1: per-symbol invariant — `SignalRepository` create check + reads
+  (`get_active_signal_for_symbol`, `get_open_signal_for_symbol`,
+  `list_active_signals`); `SignalState.active_signal_for/open_signal_for`;
+  scheduler + engine gates per tick/analysis symbol; scoped
+  `RecoveryService.recover(symbol)`; runtime passes its symbol.
+- B2: `SignalMonitor(symbol=...)` scoping (poll + race re-reads);
+  `record_trade` computes balance/peak INSIDE the write transaction (no
+  lost update on concurrent closes); executor concurrent-OPEN cap.
+- B3: Settings combo (`app_settings.symbols`, validate 1..3, audit) +
+  `signal_engine/supervisor.py` + `run-symbols.sh` (sync/stop/status;
+  pidfiles + cmdline guard; never stops an OPEN symbol; exit 1 on blocked).
+- B4: `/api/dashboard` `positions[]` + `portfolio{symbols[], full}`;
+  dashboard position cards (1 per symbol) + portfolio status line.
+
+### Operation
+
+```bash
+./run-symbols.sh sync     # converge to the Settings combo
+./run-symbols.sh status   # JSON process + position table
+./run-symbols.sh stop     # stop all (OPEN symbols refuse, exit 1)
+```
+
+Select 1–3 symbols in Settings → Save → `sync`. No restarts needed for
+selection changes. Reboot → `sync` again.
