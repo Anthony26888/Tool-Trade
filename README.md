@@ -1,4 +1,8 @@
-# BTC AI Signal & Demo Trading System (Binance Futures)
+<p align="center">
+  <img src="assets/logo%20ai.png" alt="NEXTRA AI logo" width="640" />
+</p>
+
+# NEXTRA AI — BTC Signal & Demo Trading System (Binance Futures)
 
 An AI-powered signal generation and **simulated (DEMO)** trading system for
 Binance USDT-M Futures, built on top of TradingAgents. It analyzes the market
