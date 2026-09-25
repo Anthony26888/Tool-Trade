@@ -793,5 +793,90 @@ class TestRuntimeResolvingSymbol(unittest.TestCase):
         self.assertEqual(runtime._resolving_symbol(), "ETHUSDT")
 
 
+@pytest.mark.unit
+class TestSymbolSwitch(unittest.TestCase):
+    """Settings tick list is the single switch: unticked daemons skip analysis
+    (zero LLM calls) but keep monitoring; every skip is visible in Daemon Log."""
+
+    def setUp(self):
+        self._tmp = TempDb()
+        self.addCleanup(self._tmp.close)
+
+    def _runtime_for(self, env_symbol, combo=None, analyzer_decision="LONG"):
+        md = ScriptedMarketData(
+            candles_1h=make_candles(DEFAULT_WINDOW_CANDLES), monitor_script=[]
+        )
+        analyzer, calls = _make_analyzer(analyzer_decision)
+        notifier = TracingNotifier()
+        svc = ConfigService(self._tmp.db, env={"BTCUSDT_SYMBOL": env_symbol})
+        if combo is not None:
+            svc.update_symbols({"symbols": combo})
+        repo = SignalRepository(self._tmp.db)
+        scheduler = OneHourScheduler(
+            repo, market_data=md, analyzer=analyzer, notifier=notifier
+        )
+        monitor = SignalMonitor(repo, market_data=md)
+        runtime = Runtime(
+            RUN_CONFIG,
+            database=self._tmp.db,
+            scheduler=scheduler,
+            monitor=monitor,
+            notifier=notifier,
+            config_service=svc,
+        )
+        return runtime, calls, md
+
+    def test_disabled_symbol_skips_without_llm(self):
+        runtime, calls, md = self._runtime_for("ETHUSDT", ["BTCUSDT", "XAUUSDT"])
+        self.assertEqual(runtime.tick_scheduler(), "SYMBOL_DISABLED")
+        self.assertEqual(calls, [])
+        self.assertEqual(md.klines_calls, 0)
+        heartbeat = runtime.state_store.get(RUNTIME_KEY_SCHEDULER_LAST_TICK)
+        self.assertIsNotNone(heartbeat)
+
+    def test_disabled_writes_one_log_row_per_candle(self):
+        runtime, calls, _ = self._runtime_for("ETHUSDT", ["BTCUSDT"])
+        runtime.tick_scheduler()
+        runtime.tick_scheduler()
+        rows = CandleLogRepository(self._tmp.db).list(limit=100)
+        disabled = [r for r in rows if r.outcome == "SYMBOL_DISABLED"]
+        self.assertEqual(len(disabled), 1)
+        self.assertEqual(disabled[0].symbol, "ETHUSDT")
+        self.assertEqual(disabled[0].decision, "NONE")
+        self.assertEqual(disabled[0].llm_calls, 0)
+
+    def test_enabled_symbol_runs_normally(self):
+        runtime, calls, _ = self._runtime_for(
+            "XAUUSDT", ["BTCUSDT", "XAUUSDT"]
+        )
+        self.assertEqual(runtime.tick_scheduler(), "CREATED")
+        self.assertEqual(len(calls), 1)
+
+    def test_legacy_single_symbol_runs_without_combo(self):
+        runtime, calls, _ = self._runtime_for("BTCUSDT", None)
+        self.assertNotEqual(runtime.tick_scheduler(), "SYMBOL_DISABLED")
+        self.assertEqual(len(calls), 1)
+
+    def test_disabled_symbol_monitor_still_closes_open_position(self):
+        from demo.executor import DemoExecutor
+
+        runtime, calls, md = self._runtime_for("ETHUSDT", ["BTCUSDT"])
+        repo = SignalRepository(self._tmp.db)
+        sig = repo.create_signal(
+            "ETHUSDT",
+            "1h",
+            "LONG",
+            Decimal("60000"),
+            Decimal("59000"),
+            Decimal("61000"),
+        )
+        opened = repo.transition_signal(sig.id, STATUS_OPEN)
+        self.assertIsNotNone(DemoExecutor(self._tmp.db).open_position(opened))
+        md.monitor_script = [_entry_candle(high=61500.0, low=60500.0)]
+        self.assertEqual(runtime.tick_scheduler(), "SYMBOL_DISABLED")
+        self.assertEqual(runtime.poll_monitor(), "TP_HIT")
+        self.assertEqual(repo.get_signal(sig.id).status, STATUS_TP_HIT)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

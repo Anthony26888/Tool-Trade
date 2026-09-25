@@ -355,6 +355,10 @@ class Runtime:
         #: Monotonic deadline for the next daily-report eligibility check
         #: (throttles the KV read to ~once a minute inside the hot loop).
         self._report_check_at = 0.0
+        #: Latest closed-1H-candle timestamp already logged as SYMBOL_DISABLED.
+        #: The disabled branch writes at most one daemon-log row per candle so
+        #: an unticked symbol stays visible without spamming the log.
+        self._last_disabled_ts: int | None = None
 
     # -- Startup recovery -------------------------------------------------------
 
@@ -469,6 +473,26 @@ class Runtime:
             self.config_service.apply_pending_if_idle()
         except Exception as exc:  # pragma: no cover - best-effort
             logger.warning("[Runtime] pending config promotion failed: %s", exc)
+        # Symbol switch: the Settings tick list is the single switch. A daemon
+        # whose own symbol is not enabled skips analysis entirely — no candle
+        # fetch, no indicators, no LLM call — but TP/SL monitoring
+        # (poll_monitor) is untouched so an OPEN position is watched to the
+        # end. Heartbeat stays fresh so health does not report a dead
+        # scheduler for a deliberately resting symbol.
+        try:
+            own_symbol = self.config_service.resolve_daemon_symbol()
+        except Exception:  # pragma: no cover - best-effort fallback
+            own_symbol = self.config.symbol
+        try:
+            enabled = self.config_service.get_symbols_public().get("symbols", [])
+        except Exception:  # pragma: no cover - best-effort fallback
+            enabled = []
+        if enabled and own_symbol not in enabled:
+            now = _now_iso()
+            self.state_store.set(RUNTIME_KEY_SCHEDULER_LAST_TICK, now)
+            self._clear_error()
+            self._log_disabled_tick(own_symbol)
+            return "SYMBOL_DISABLED"
         now = _now_iso()
         result = self.scheduler.tick()
         self.state_store.set(RUNTIME_KEY_SCHEDULER_LAST_TICK, now)
@@ -477,6 +501,37 @@ class Runtime:
         else:
             self._clear_error()
         return result.outcome.value
+
+    def _log_disabled_tick(self, symbol: str) -> None:
+        """Write at most one SYMBOL_DISABLED daemon-log row per closed 1H candle.
+
+        Uses a single free public-data fetch (never the LLM) to anchor the row
+        to the latest closed candle. Never raises: logging must not block the
+        pipeline (AGENTS.md 27).
+        """
+        try:
+            closed = self.scheduler.market_data.fetch_closed_klines(
+                symbol, "1h", limit=2
+            )
+            closed = [c for c in closed if c.is_closed]
+            if not closed:
+                return
+            candle_ts = max(c.timestamp for c in closed)
+            if candle_ts == self._last_disabled_ts:
+                return
+            CandleLogRepository(self.database).upsert(
+                symbol=symbol,
+                timeframe="1h",
+                candle_timestamp_ms=int(candle_ts),
+                outcome="SYMBOL_DISABLED",
+                decision="NONE",
+                recorded_at=_now_iso(),
+                error_notes=f"{symbol} not in enabled Settings symbols; analysis resting",
+                llm_calls=0,
+            )
+            self._last_disabled_ts = candle_ts
+        except Exception as exc:
+            logger.warning("[Runtime] disabled-tick log write failed: %s", exc)
 
     def poll_monitor(self) -> str:
         """Run one monitor poll, heartbeat it, handle demo/notifications.
