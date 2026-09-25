@@ -125,6 +125,8 @@ curl http://localhost:8000/api/health
 The `btcusdt_data` volume (`/app/data`) holds the SQLite ledger and the
 `0600` secrets file, so balance, history and OPEN positions survive rebuilds.
 For the full pull-without-data-loss procedure see [`DEPLOY.md`](DEPLOY.md).
+For a beginner-friendly tour of every tab and button see
+[`USERGUIDE.md`](USERGUIDE.md).
 
 **Choose one AI provider in `.env`:**
 
