@@ -15,6 +15,14 @@ mkdir -p "$DATA_DIR"
 HOST="${BTCUSDT_WEB_HOST:-0.0.0.0}"
 PORT="${BTCUSDT_WEB_PORT:-8000}"
 
+# DAEMON_ONLY=1 (extra per-symbol services in docker-compose.yml): skip the
+# web dashboard and run just the daemon. The main service keeps the default
+# (web + daemon) so there is exactly one dashboard per host.
+if [ "${DAEMON_ONLY:-0}" = "1" ]; then
+    echo "[signalengine] daemon-only (BTCUSDT_SYMBOL=${BTCUSDT_SYMBOL:-BTCUSDT}) -> AI(1H) analysis + TP/SL(1m) monitor"
+    exec python -m signal_engine
+fi
+
 echo "[signalengine] web dashboard -> http://${HOST}:${PORT}"
 python -m signal_engine web --host "$HOST" --port "$PORT" &
 WEB_PID=$!
